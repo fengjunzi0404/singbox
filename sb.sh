@@ -26,7 +26,7 @@ CERT_DIR="$CONFIG_DIR/cert"
 SUB_DIR="$CONFIG_DIR/subscription"
 SUB_PORT=2096
 SCRIPT_PATH="/usr/local/bin/sb"
-SCRIPT_URL="https://raw.githubusercontent.com/singbox-suite/singbox-deploy/main/sb.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/fengjunzi0404/singbox/main/sb.sh"
 
 # Global Variables
 SERVER_IPV4=""

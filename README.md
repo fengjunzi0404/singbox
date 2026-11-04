@@ -50,11 +50,14 @@
 
 ## 📦 极速安装方式
 
-在服务器终端直接执行以下一键命令：
+在服务器终端直接执行以下一键命令（自动支持 IPv4 与纯 IPv6）：
 
 ```bash
-# 适用于 Ubuntu 20.04+, Debian 11+, CentOS 8+, Rocky Linux, Alpine
-curl -fsSL https://raw.githubusercontent.com/singbox-suite/singbox-deploy/main/sb.sh -o /usr/local/bin/sb && chmod +x /usr/local/bin/sb && /usr/local/bin/sb
+# 推荐：wget 方式 (适用于 Hax 等未预装 curl 的纯 IPv6 系统)
+wget -qO /usr/local/bin/sb https://raw.githubusercontent.com/fengjunzi0404/singbox/main/sb.sh && chmod +x /usr/local/bin/sb && /usr/local/bin/sb
+
+# 或使用 curl 方式：
+curl -fsSL https://raw.githubusercontent.com/fengjunzi0404/singbox/main/sb.sh -o /usr/local/bin/sb && chmod +x /usr/local/bin/sb && /usr/local/bin/sb
 ```
 
 以后随时在服务器输入快捷命令即可唤出管理面板：
