@@ -74,48 +74,56 @@ check_os() {
 # ------------------------------------------------------------------------------
 # IP Stack & NAT64 Check (Special Optimization for Pure IPv6 VPS)
 # ------------------------------------------------------------------------------
+detect_ips() {
+    SERVER_IPV4=""
+    SERVER_IPV6=""
+    if command -v curl >/dev/null 2>&1; then
+        SERVER_IPV4=$(curl -4 -s --connect-timeout 2 https://api.ipify.org 2>/dev/null || curl -4 -s --connect-timeout 2 https://ipv4.icanhazip.com 2>/dev/null || true)
+        SERVER_IPV6=$(curl -6 -s --connect-timeout 2 https://api64.ipify.org 2>/dev/null || curl -6 -s --connect-timeout 2 https://ipv6.icanhazip.com 2>/dev/null || true)
+    elif command -v wget >/dev/null 2>&1; then
+        SERVER_IPV4=$(wget -T 2 -t 1 -qO- http://api.ipify.org 2>/dev/null || true)
+        SERVER_IPV6=$(wget -T 2 -t 1 -qO- http://api64.ipify.org 2>/dev/null || true)
+    fi
+    if [[ -z "$SERVER_IPV6" ]]; then
+        SERVER_IPV6=$(ip -6 addr show scope global 2>/dev/null | grep inet6 | head -n 1 | awk '{print $2}' | cut -d/ -f1 || true)
+    fi
+}
+
 check_ip_stack() {
     echo -e "${CYAN}正在检测 VPS 网络协议栈 (IPv4 / IPv6)... ${PLAIN}"
-    SERVER_IPV4=$(curl -4 -s --connect-timeout 3 https://api.ipify.org 2>/dev/null || curl -4 -s --connect-timeout 3 https://ipv4.icanhazip.com 2>/dev/null || true)
-    SERVER_IPV6=$(curl -6 -s --connect-timeout 3 https://api64.ipify.org 2>/dev/null || curl -6 -s --connect-timeout 3 https://ipv6.icanhazip.com 2>/dev/null || true)
+    detect_ips
 
-    if [[ -z "$SERVER_IPV4" && -n "$SERVER_IPV6" ]]; then
+    # Check default IPv4 route or lack of IPv4
+    local has_ipv4_route
+    has_ipv4_route=$(ip -4 route show default 2>/dev/null || true)
+
+    if [[ -z "$SERVER_IPV4" && ( -n "$SERVER_IPV6" || -z "$has_ipv4_route" ) ]]; then
         IS_IPV6_ONLY=true
-        echo -e "${YELLOW}[提示] 检测到当前 VPS 为【纯 IPv6 (IPv6-Only)】环境！${PLAIN}"
+        echo -e "${YELLOW}[提示] 检测到当前 VPS 为【纯 IPv6 (IPv6-Only / 如 Hax)】环境！${PLAIN}"
         setup_nat64_if_needed
     elif [[ -n "$SERVER_IPV4" && -n "$SERVER_IPV6" ]]; then
         echo -e "${GREEN}[OK] 检测到双栈网络: IPv4: $SERVER_IPV4 | IPv6: $SERVER_IPV6${PLAIN}"
-    elif [[ -n "$SERVER_IPV4" && -z "$SERVER_IPV6" ]]; then
-        echo -e "${GREEN}[OK] 检测到原生单栈 IPv4: $SERVER_IPV4${PLAIN}"
+    elif [[ -n "$SERVER_IPV4" ]]; then
+        echo -e "${GREEN}[OK] 检测到原生 IPv4: $SERVER_IPV4${PLAIN}"
     else
-        echo -e "${YELLOW}未能自动解析到公网 IP，将使用本地回环/占位地址。${PLAIN}"
+        echo -e "${YELLOW}[提示] 纯 IPv6 环境，公网 IPv6: ${SERVER_IPV6:-"自动探测"}${PLAIN}"
+        setup_nat64_if_needed
     fi
 }
 
 setup_nat64_if_needed() {
-    # Test if GitHub is reachable over pure IPv6
-    if ! curl -s --connect-timeout 3 https://api.github.com >/dev/null 2>&1; then
-        echo -e "${YELLOW}纯 IPv6 VPS 无法直接访问 GitHub，正在自动配置 DNS64 / NAT64 解析以获取 IPv4 访问能力...${PLAIN}"
-        
-        # Backup resolv.conf
-        [[ ! -f /etc/resolv.conf.bak ]] && cp /etc/resolv.conf /etc/resolv.conf.bak
+    echo -e "${YELLOW}正在为纯 IPv6 VPS 强化注入 DNS64 / NAT64 解析服务器以打通 GitHub 与海外下载...${PLAIN}"
+    [[ ! -f /etc/resolv.conf.bak ]] && cp /etc/resolv.conf /etc/resolv.conf.bak 2>/dev/null || true
 
-        # Inject well-known stable DNS64 servers (Cloudflare & Trex)
-        cat << 'EOF' > /etc/resolv.conf
-nameserver 2606:4700:4700::1111
-nameserver 2001:4860:4860::8888
+    # Inject well-known stable high-speed NAT64 resolvers (Trex, Cloudflare, Nat64.net)
+    cat << 'EOF' > /etc/resolv.conf
 nameserver 2a00:1098:2b::1
 nameserver 2a01:4f8:c2c:123f::1
+nameserver 2a00:1098:2c::1
+nameserver 2606:4700:4700::1111
+nameserver 2001:4860:4860::8888
 EOF
-        echo -e "${GREEN}DNS64 解析已配置！再次验证 GitHub 连通性...${PLAIN}"
-        if curl -s --connect-timeout 5 https://api.github.com >/dev/null 2>&1; then
-            echo -e "${GREEN}[成功] 已通过 NAT64 成功打通 GitHub 与 IPv4 互联网访问！${PLAIN}"
-        else
-            echo -e "${RED}[警告] NAT64 解析未能联通，推荐在稍后功能 13 中启用 Cloudflare WARP 双栈出站。${PLAIN}"
-        fi
-    else
-        echo -e "${GREEN}[OK] 当前纯 IPv6 网络已自带 NAT64 或 GitHub 可直连访问。${PLAIN}"
-    fi
+    echo -e "${GREEN}[OK] DNS64/NAT64 解析强化配置完成！${PLAIN}"
 }
 
 # ------------------------------------------------------------------------------
@@ -140,6 +148,55 @@ install_dependencies() {
             apt-get update -y || yum install -y || true
             ;;
     esac
+    # Re-detect IP after curl/wget installed
+    detect_ips
+}
+
+# ------------------------------------------------------------------------------
+# Fast Multi-Source Downloader (Mirrors + Direct + Progress Bar)
+# ------------------------------------------------------------------------------
+download_singbox_binary() {
+    local filename="$1"
+    local tag="$2"
+    local primary_url="https://github.com/SagerNet/sing-box/releases/download/${tag}/${filename}"
+    local mirror1="https://ghproxy.net/${primary_url}"
+    local mirror2="https://gh-proxy.com/${primary_url}"
+    local mirror3="https://mirror.ghproxy.com/${primary_url}"
+
+    local urls=("$mirror1" "$mirror2" "$mirror3" "$primary_url")
+    local success=false
+
+    echo -e "${CYAN}正在拉取 Sing-box 官方核心文件 (${filename})...${PLAIN}"
+
+    for u in "${urls[@]}"; do
+        echo -e "正在从源拉取: ${BLUE}$u${PLAIN}"
+        rm -f "/tmp/${filename}"
+
+        if command -v curl >/dev/null 2>&1; then
+            if curl -fL --progress-bar --connect-timeout 8 --max-time 120 -o "/tmp/${filename}" "$u"; then
+                if [[ -s "/tmp/${filename}" ]]; then
+                    success=true
+                    echo -e "${GREEN}[成功] 下载完成！${PLAIN}"
+                    break
+                fi
+            fi
+        elif command -v wget >/dev/null 2>&1; then
+            if wget --show-progress -T 10 -t 2 -O "/tmp/${filename}" "$u"; then
+                if [[ -s "/tmp/${filename}" ]]; then
+                    success=true
+                    echo -e "${GREEN}[成功] 下载完成！${PLAIN}"
+                    break
+                fi
+            fi
+        fi
+
+        echo -e "${YELLOW}此源连接缓慢，正在自动切换备用加速源...${PLAIN}"
+    done
+
+    if [[ "$success" != "true" ]]; then
+        echo -e "${RED}下载 Sing-box 核心失败！请检查 VPS 的 NAT64 或网络连通状态。${PLAIN}"
+        exit 1
+    fi
 }
 
 # ------------------------------------------------------------------------------
@@ -155,21 +212,19 @@ install_singbox() {
     mkdir -p "$CONFIG_DIR" "$CERT_DIR" "$SUB_DIR"
 
     echo -e "\n${CYAN}=== 正在获取 Sing-box 官方最新内核版本 ===${PLAIN}"
-    local tag_name
-    tag_name=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name 2>/dev/null)
-    [[ -z "$tag_name" || "$tag_name" == "null" ]] && tag_name="v1.11.0"
+    local tag_name="v1.11.0"
+    if command -v curl >/dev/null 2>&1; then
+        local fetched_tag
+        fetched_tag=$(curl -s --connect-timeout 4 https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null | jq -r .tag_name 2>/dev/null)
+        [[ -n "$fetched_tag" && "$fetched_tag" != "null" ]] && tag_name="$fetched_tag"
+    fi
     local clean_ver=${tag_name#v}
-
     local filename="sing-box-${clean_ver}-linux-${ARCH}.tar.gz"
-    local download_url="https://github.com/SagerNet/sing-box/releases/download/${tag_name}/${filename}"
 
     echo -e "下载版本: ${GREEN}${tag_name}${PLAIN} (${ARCH})"
-    echo -e "下载地址: ${BLUE}${download_url}${PLAIN}"
 
-    wget -qO "/tmp/${filename}" "${download_url}" || {
-        echo -e "${RED}下载 Sing-box 失败，请检查网络或 GitHub 连通状态。${PLAIN}"
-        exit 1
-    }
+    # Multi-source fast download with progress bar
+    download_singbox_binary "$filename" "$tag_name"
 
     tar -zxvf "/tmp/${filename}" -C /tmp/ >/dev/null 2>&1
     local extracted_bin
@@ -755,30 +810,25 @@ update_singbox_core() {
     check_arch
     echo -e "\n${CYAN}=== 更新 / 切换 Sing-box 官方内核 ===${PLAIN}"
     read -rp "请输入要切换的官方版本号 (如 v1.11.0, 留空默认最新正式版): " target_ver
-    local download_url
+    local tag_name
     if [[ -z "$target_ver" ]]; then
-        local tag_name
-        tag_name=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name)
+        tag_name=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null | jq -r .tag_name 2>/dev/null)
         [[ -z "$tag_name" || "$tag_name" == "null" ]] && tag_name="v1.11.0"
-        local clean_ver=${tag_name#v}
-        download_url="https://github.com/SagerNet/sing-box/releases/download/${tag_name}/sing-box-${clean_ver}-linux-${ARCH}.tar.gz"
     else
         [[ "$target_ver" != v* ]] && target_ver="v$target_ver"
-        local clean_ver=${target_ver#v}
-        download_url="https://github.com/SagerNet/sing-box/releases/download/${target_ver}/sing-box-${clean_ver}-linux-${ARCH}.tar.gz"
+        tag_name="$target_ver"
     fi
+    local clean_ver=${tag_name#v}
+    local filename="sing-box-${clean_ver}-linux-${ARCH}.tar.gz"
 
-    echo -e "下载: $download_url"
-    wget -qO "/tmp/singbox_new.tar.gz" "$download_url" || {
-        echo -e "${RED}下载失败，版本可能不存在！${PLAIN}"
-        return
-    }
-    tar -zxvf "/tmp/singbox_new.tar.gz" -C /tmp/ >/dev/null 2>&1
+    download_singbox_binary "$filename" "$tag_name"
+
+    tar -zxvf "/tmp/${filename}" -C /tmp/ >/dev/null 2>&1
     local b_path
     b_path=$(find /tmp -type f -name "sing-box" | head -n 1)
     cp "$b_path" /usr/local/bin/sing-box
     chmod +x /usr/local/bin/sing-box
-    rm -f "/tmp/singbox_new.tar.gz"
+    rm -rf "/tmp/${filename}" "/tmp/sing-box-${clean_ver}-linux-${ARCH}"
     systemctl restart sing-box
     echo -e "${GREEN}切换成功！当前版本: $(/usr/local/bin/sing-box version | head -n 1)${PLAIN}"
 }
