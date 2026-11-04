@@ -1,0 +1,168 @@
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "dns-remote",
+        "address": "tls://1.1.1.1",
+        "address_resolver": "dns-local",
+        "strategy": "prefer_ipv4"
+      },
+      {
+        "tag": "dns-local",
+        "address": "223.5.5.5",
+        "detour": "direct"
+      }
+    ],
+    "rules": [
+      {
+        "outbound": "any",
+        "server": "dns-local"
+      }
+    ],
+    "strategy": "prefer_ipv4"
+  },
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-reality-in",
+      "listen": "::",
+      "listen_port": 443,
+      "sniff": true,
+      "users": [
+        {
+          "uuid": "41b02f1d-0efb-49ef-873c-5e329d390989",
+          "flow": "xtls-rprx-vision"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "www.apple.com",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "www.apple.com",
+            "server_port": 443
+          },
+          "private_key": "PRIVATE_KEY_GENERATED_BY_SINGBOX",
+          "short_id": [
+            "a1b2c3d4e5f67890"
+          ]
+        }
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hy2-in",
+      "listen": "::",
+      "listen_port": 8443,
+      "users": [
+        {
+          "password": "HY2_SECURE_PASSWORD"
+        }
+      ],
+      "ignore_client_bandwidth": false,
+      "tls": {
+        "enabled": true,
+        "certificate_path": "/etc/sing-box/cert/server.crt",
+        "key_path": "/etc/sing-box/cert/server.key"
+      }
+    },
+    {
+      "type": "tuic",
+      "tag": "tuic-in",
+      "listen": "::",
+      "listen_port": 9443,
+      "users": [
+        {
+          "uuid": "41b02f1d-0efb-49ef-873c-5e329d390989",
+          "password": "TUIC_SECURE_PASSWORD"
+        }
+      ],
+      "congestion_control": "bbr",
+      "tls": {
+        "enabled": true,
+        "alpn": [
+          "h3",
+          "spdy/3.1"
+        ],
+        "certificate_path": "/etc/sing-box/cert/server.crt",
+        "key_path": "/etc/sing-box/cert/server.key"
+      }
+    },
+    {
+      "type": "naive",
+      "tag": "naive-in",
+      "listen": "::",
+      "listen_port": 10443,
+      "users": [
+        {
+          "username": "admin",
+          "password": "NAIVE_SECURE_PASSWORD"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "/etc/sing-box/cert/server.crt",
+        "key_path": "/etc/sing-box/cert/server.key"
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "anytls-in",
+      "listen": "::",
+      "listen_port": 11443,
+      "users": [
+        {
+          "uuid": "41b02f1d-0efb-49ef-873c-5e329d390989"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "/etc/sing-box/cert/server.crt",
+        "key_path": "/etc/sing-box/cert/server.key"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct",
+      "domain_strategy": "prefer_ipv4"
+    },
+    {
+      "type": "socks",
+      "tag": "warp-out",
+      "server": "127.0.0.1",
+      "server_port": 40000
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "geosite": "category-ads-all",
+        "outbound": "block"
+      },
+      {
+        "geosite": [
+          "openai",
+          "netflix"
+        ],
+        "outbound": "warp-out"
+      },
+      {
+        "geoip": "cn",
+        "geosite": "cn",
+        "outbound": "direct"
+      }
+    ],
+    "auto_detect_interface": true
+  }
+}
