@@ -72,6 +72,17 @@ check_os() {
     fi
 }
 
+get_random_port() {
+    local p
+    while true; do
+        p=$(( (RANDOM << 15 | RANDOM) % 45000 + 15000 ))
+        if ! ss -tulpn 2>/dev/null | grep -q ":$p "; then
+            echo "$p"
+            return
+        fi
+    done
+}
+
 # ------------------------------------------------------------------------------
 # IP Stack & NAT64 Check (Special Optimization for Pure IPv6 VPS)
 # ------------------------------------------------------------------------------
@@ -264,22 +275,32 @@ install_singbox() {
     # 1. Domain & Acme
     read -rp "请输入你的解析域名 (如 node.example.com，用于Hy2/TUIC/Naive/AnyTLS，留空则自签/仅IP): " DOMAIN_NAME
     
-    # 2. Ports
-    echo -e "${YELLOW}提示: 国内运营商常封锁 IPv6 443 端口。F佬推荐使用高位非标端口(如 7443)防止被运营商阻断。${PLAIN}"
-    read -rp "请输入 VLESS-Reality 监听端口 [推荐 7443, 留空默认 7443]: " PORT_REALITY
-    PORT_REALITY=${PORT_REALITY:-7443}
+    # 2. Random High Ports by Default (彻底规避运营商封锁与端口冲突)
+    local r_reality=$(get_random_port)
+    local r_hy2=$(get_random_port)
+    local r_tuic=$(get_random_port)
+    local r_naive=$(get_random_port)
+    local r_anytls=$(get_random_port)
+    local r_sub=$(get_random_port)
 
-    read -rp "请输入 Hysteria 2 监听端口 [默认 8443]: " PORT_HY2
-    PORT_HY2=${PORT_HY2:-8443}
+    echo -e "${YELLOW}提示: 默认生成高位随机非标端口(15000-60000)，彻底规避运营商 80/443/8443 封锁与端口冲突。直接回车使用随机分配。${PLAIN}"
+    read -rp "请输入 VLESS-Reality 监听端口 [默认随机 $r_reality]: " PORT_REALITY
+    PORT_REALITY=${PORT_REALITY:-$r_reality}
 
-    read -rp "请输入 TUIC v5 监听端口 [默认 9443]: " PORT_TUIC
-    PORT_TUIC=${PORT_TUIC:-9443}
+    read -rp "请输入 Hysteria 2 监听端口 [默认随机 $r_hy2]: " PORT_HY2
+    PORT_HY2=${PORT_HY2:-$r_hy2}
 
-    read -rp "请输入 NaiveProxy 监听端口 [默认 10443]: " PORT_NAIVE
-    PORT_NAIVE=${PORT_NAIVE:-10443}
+    read -rp "请输入 TUIC v5 监听端口 [默认随机 $r_tuic]: " PORT_TUIC
+    PORT_TUIC=${PORT_TUIC:-$r_tuic}
 
-    read -rp "请输入 AnyTLS 监听端口 [默认 11443]: " PORT_ANYTLS
-    PORT_ANYTLS=${PORT_ANYTLS:-11443}
+    read -rp "请输入 NaiveProxy 监听端口 [默认随机 $r_naive]: " PORT_NAIVE
+    PORT_NAIVE=${PORT_NAIVE:-$r_naive}
+
+    read -rp "请输入 AnyTLS 监听端口 [默认随机 $r_anytls]: " PORT_ANYTLS
+    PORT_ANYTLS=${PORT_ANYTLS:-$r_anytls}
+
+    read -rp "请输入 订阅微服务 监听端口 [默认随机 $r_sub]: " SUB_PORT
+    SUB_PORT=${SUB_PORT:-$r_sub}
 
     # 3. UUID & Passwords
     echo -e "\n${CYAN}正在生成安全密钥与 UUID...${PLAIN}"
@@ -318,6 +339,7 @@ PORT_HY2=$PORT_HY2
 PORT_TUIC=$PORT_TUIC
 PORT_NAIVE=$PORT_NAIVE
 PORT_ANYTLS=$PORT_ANYTLS
+SUB_PORT=$SUB_PORT
 UUID="$uuid_val"
 HY2_PWD="$hy2_pwd"
 TUIC_PWD="$tuic_pwd"
@@ -404,6 +426,13 @@ build_server_config() {
         domain_strat="prefer_ipv4"
     fi
 
+    local p_reality="${PORT_REALITY:-7443}"
+    local p_hy2="${PORT_HY2:-8443}"
+    local p_tuic="${PORT_TUIC:-9443}"
+    local p_naive="${PORT_NAIVE:-10443}"
+    local p_anytls="${PORT_ANYTLS:-11443}"
+    local r_sni="${REALITY_SNI:-addons.mozilla.org}"
+
     cat << EOF > "$CONFIG_FILE"
 {
   "log": {
@@ -415,7 +444,7 @@ build_server_config() {
       "type": "vless",
       "tag": "vless-reality-in",
       "listen": "$listen_addr",
-      "listen_port": $PORT_REALITY,
+      "listen_port": $p_reality,
       "users": [
         {
           "uuid": "$UUID",
@@ -424,11 +453,11 @@ build_server_config() {
       ],
       "tls": {
         "enabled": true,
-        "server_name": "$REALITY_SNI",
+        "server_name": "$r_sni",
         "reality": {
           "enabled": true,
           "handshake": {
-            "server": "$REALITY_SNI",
+            "server": "$r_sni",
             "server_port": 443
           },
           "private_key": "$REALITY_PRIV",
@@ -442,7 +471,7 @@ build_server_config() {
       "type": "hysteria2",
       "tag": "hy2-in",
       "listen": "$listen_addr",
-      "listen_port": $PORT_HY2,
+      "listen_port": $p_hy2,
       "users": [
         {
           "password": "$HY2_PWD"
@@ -459,7 +488,7 @@ build_server_config() {
       "type": "tuic",
       "tag": "tuic-in",
       "listen": "$listen_addr",
-      "listen_port": $PORT_TUIC,
+      "listen_port": $p_tuic,
       "users": [
         {
           "uuid": "$UUID",
@@ -481,7 +510,7 @@ build_server_config() {
       "type": "naive",
       "tag": "naive-in",
       "listen": "$listen_addr",
-      "listen_port": $PORT_NAIVE,
+      "listen_port": $p_naive,
       "users": [
         {
           "username": "$NAIVE_USER",
@@ -498,7 +527,7 @@ build_server_config() {
       "type": "vless",
       "tag": "anytls-in",
       "listen": "$listen_addr",
-      "listen_port": $PORT_ANYTLS,
+      "listen_port": $p_anytls,
       "users": [
         {
           "uuid": "$UUID"
@@ -567,6 +596,7 @@ setup_sub_server() {
     cat << 'PYEOF' > "$SUB_DIR/server.py"
 import http.server
 import socketserver
+import socket
 import os
 import json
 import base64
@@ -619,53 +649,68 @@ class SubHandler(http.server.SimpleHTTPRequestHandler):
 
         fmt = qs.get("format", ["base64"])[0]
 
-        if fmt == "clash":
+        if fmt in ["clash", "karing", "meta"]:
             self.send_response(200)
             self.send_header("Content-Type", "text/yaml; charset=utf-8")
+            self.send_header("profile-update-interval", "24")
             self.end_headers()
             yaml_out = f"""port: 7890
 socks-port: 7891
+allow-lan: false
 mode: rule
+log-level: info
 proxies:
-  - name: "Reality-Node"
+  - name: "Reality [{ip}]"
     type: vless
-    server: {ip}
+    server: "{ip}"
     port: {env.get('PORT_REALITY', 7443)}
-    uuid: {uuid}
+    uuid: "{uuid}"
     network: tcp
     tls: true
     flow: xtls-rprx-vision
-    servername: {env.get('REALITY_SNI', 'addons.mozilla.org')}
+    servername: "{env.get('REALITY_SNI', 'addons.mozilla.org')}"
     reality-opts:
-      public-key: {env.get('REALITY_PUB', '')}
-      short-id: {env.get('REALITY_SHORT_ID', '')}
+      public-key: "{env.get('REALITY_PUB', '')}"
+      short-id: "{env.get('REALITY_SHORT_ID', '')}"
     client-fingerprint: chrome
-  - name: "Hy2-Node"
+  - name: "Hy2 [{domain if domain else ip}]"
     type: hysteria2
-    server: {domain if domain else ip}
+    server: "{domain if domain else ip}"
     port: {env.get('PORT_HY2', 8443)}
-    password: {env.get('HY2_PWD', '')}
-    sni: {domain if domain else ip}
+    password: "{env.get('HY2_PWD', '')}"
+    sni: "{domain if domain else ip}"
     skip-cert-verify: true
-  - name: "TUIC-Node"
+  - name: "TUIC [{domain if domain else ip}]"
     type: tuic
-    server: {domain if domain else ip}
+    server: "{domain if domain else ip}"
     port: {env.get('PORT_TUIC', 9443)}
-    uuid: {uuid}
-    password: {env.get('TUIC_PWD', '')}
+    uuid: "{uuid}"
+    password: "{env.get('TUIC_PWD', '')}"
     congestion-controller: bbr
     alpn: [h3]
-    sni: {domain if domain else ip}
+    sni: "{domain if domain else ip}"
     skip-cert-verify: true
-  - name: "AnyTLS-Node"
+  - name: "AnyTLS [{domain if domain else ip}]"
     type: vless
-    server: {domain if domain else ip}
+    server: "{domain if domain else ip}"
     port: {env.get('PORT_ANYTLS', 11443)}
-    uuid: {uuid}
+    uuid: "{uuid}"
     network: tcp
     tls: true
-    servername: {domain if domain else ip}
+    servername: "{domain if domain else ip}"
     skip-cert-verify: true
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - "Reality [{ip}]"
+      - "Hy2 [{domain if domain else ip}]"
+      - "TUIC [{domain if domain else ip}]"
+      - "AnyTLS [{domain if domain else ip}]"
+rules:
+  - GEOIP,LAN,DIRECT
+  - GEOIP,CN,DIRECT
+  - MATCH,PROXY
 """
             self.wfile.write(yaml_out.encode('utf-8'))
         else:
@@ -680,11 +725,13 @@ class DualStackServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
 
 if __name__ == '__main__':
+    env = load_env()
+    sub_port = int(env.get("SUB_PORT", 2096))
     try:
-        with DualStackServer(("::", PORT), SubHandler) as httpd:
+        with DualStackServer(("::", sub_port), SubHandler) as httpd:
             httpd.serve_forever()
     except Exception:
-        with socketserver.TCPServer(("", PORT), SubHandler) as httpd:
+        with socketserver.TCPServer(("", sub_port), SubHandler) as httpd:
             httpd.serve_forever()
 PYEOF
 
