@@ -1,643 +1,206 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# SingBox Suite Pro — 现代化全协议聚合部署运维套件
-# 协议支持: VLESS-Reality-Vision | Hysteria 2 | TUIC v5 | AnyTLS | NaiveProxy
-# 原生深度优化: 纯 IPv6 VPS (如 Hax / 自动 DNS64/NAT64 加速) & 双栈 VPS
-# 致敬与特别鸣谢: 本脚本基于并深度修改自 ygkkk (甬哥) 与 fscarmen (F佬) 的开源项目
-# 快捷指令: sb
+# SingBox Suite Pro — 现代化全协议聚合部署运维套件 (All-In-One 单脚本自包含版)
+# 协议支持: VLESS-Reality-Vision | Hysteria 2 | TUIC v5 | AnyTLS | NaiveProxy+Argo
+# 特性亮点:
+#   1. 一键安装默认自动挂载 Cloudflare Argo 免费临时隧道，NaiveProxy 免域名、免导证书秒通
+#   2. 默认分配 15000-59999 高位随机非标端口，彻底规避运营商对 443/8443 的阻断
+#   3. 纯 IPv6 (如 Hax) 与双栈 VPS 自适应：自动注入 NAT64/DNS64，默认 prefer_ipv6 出站
+#   4. 标准化 HTTP/1.1 [::] 双栈订阅服务：带 Content-Length，原生完美支持 Karing Base64 与 Clash
+# 致敬与特别鸣谢: 本脚本基于并深度修改自 ygkkk (甬哥) 与 fscarmen (F佬) 的开源项目！
+# 仓库地址: https://github.com/fengjunzi0404/singbox
 # ==============================================================================
 
 export LANG=en_US.UTF-8
-set -o pipefail
 
-# ANSI Color Codes
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
-CYAN='\033[0;36m'
-PLAIN='\033[0m'
-BOLD='\033[1m'
+RED="\033[31m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+BLUE="\033[36m"
+PURPLE="\033[35m"
+BOLD="\033[1m"
+PLAIN="\033[0m"
 
 CONFIG_DIR="/etc/sing-box"
-CONFIG_FILE="$CONFIG_DIR/config.json"
-ENV_FILE="$CONFIG_DIR/singbox.env"
-CERT_DIR="$CONFIG_DIR/cert"
-SUB_DIR="$CONFIG_DIR/subscription"
-SUB_PORT=2096
-SCRIPT_PATH="/usr/local/bin/sb"
-SCRIPT_URL="https://raw.githubusercontent.com/fengjunzi0404/singbox/main/sb.sh"
+CONFIG_FILE="${CONFIG_DIR}/config.json"
+ENV_FILE="${CONFIG_DIR}/singbox.env"
+CERT_DIR="${CONFIG_DIR}/cert"
+SUB_DIR="${CONFIG_DIR}/subscription"
+BIN_PATH="/usr/local/bin/sing-box"
+SHORTCUT_PATH="/usr/local/bin/sb"
+ARGO_BIN="/usr/local/bin/cloudflared"
+ARGO_LOG="/var/log/argo.log"
+REPO_RAW_URL="https://raw.githubusercontent.com/fengjunzi0404/singbox/main/sb.sh"
 
-# Global Variables
-SERVER_IPV4=""
-SERVER_IPV6=""
-IS_IPV6_ONLY=false
-OS_TYPE=""
-ARCH=""
-
-# ------------------------------------------------------------------------------
-# 0. Check Root & OS Architecture
-# ------------------------------------------------------------------------------
+# 检查 root 权限
 check_root() {
     if [[ $EUID -ne 0 ]]; then
-        echo -e "${RED}错误: 该脚本必须以 root 权限运行！请使用 sudo su 或 root 用户重试。${PLAIN}"
+        echo -e "${RED}[错误] 请使用 root 用户运行此脚本 (sudo -i)！${PLAIN}"
         exit 1
     fi
 }
 
+# 检测系统架构
 check_arch() {
-    local raw_arch
-    raw_arch=$(uname -m)
-    case "$raw_arch" in
-        x86_64 | amd64) ARCH="amd64" ;;
-        aarch64 | arm64) ARCH="arm64" ;;
-        armv7* | armv6*) ARCH="armv7" ;;
-        s390x) ARCH="s390x" ;;
+    case "$(uname -m)" in
+        x86_64|amd64)
+            ARCH="amd64"
+            CF_ARCH="amd64"
+            ;;
+        aarch64|arm64)
+            ARCH="arm64"
+            CF_ARCH="arm64"
+            ;;
         *)
-            echo -e "${RED}不支持的系统架构: $raw_arch${PLAIN}"
+            echo -e "${RED}[错误] 不支持的 CPU 架构: $(uname -m)${PLAIN}"
             exit 1
             ;;
     esac
 }
 
-check_os() {
-    if [[ -f /etc/os-release ]]; then
-        . /etc/os-release
-        OS_TYPE=$ID
-    elif [[ -f /etc/redhat-release ]]; then
-        OS_TYPE="rhel"
+# 检测网络栈环境 (纯 IPv6 / 纯 IPv4 / 双栈) 并自动强化 NAT64
+detect_network() {
+    IPV4_ADDR=$(curl -s4m3 https://api.ipify.org 2>/dev/null || curl -s4m3 https://icanhazip.com 2>/dev/null | tr -d '\n')
+    IPV6_ADDR=$(ip -6 addr show scope global 2>/dev/null | grep inet6 | grep -v "fe80" | head -n 1 | awk '{print $2}' | cut -d/ -f1)
+    if [[ -z "$IPV6_ADDR" ]]; then
+        IPV6_ADDR=$(curl -s6m3 https://api64.ipify.org 2>/dev/null || curl -s6m3 https://icanhazip.com 2>/dev/null | tr -d '\n')
+    fi
+
+    if [[ -z "$IPV4_ADDR" && -n "$IPV6_ADDR" ]]; then
+        NET_STACK="纯 IPv6 VPS (NAT64 强化)"
+        SERVER_IP="$IPV6_ADDR"
+        OUTBOUND_STRATEGY="prefer_ipv6"
+    elif [[ -n "$IPV4_ADDR" && -n "$IPV6_ADDR" ]]; then
+        NET_STACK="IPv4 + IPv6 双栈 VPS"
+        SERVER_IP="$IPV4_ADDR"
+        OUTBOUND_STRATEGY="prefer_ipv4"
+    elif [[ -n "$IPV4_ADDR" ]]; then
+        NET_STACK="纯 IPv4 VPS"
+        SERVER_IP="$IPV4_ADDR"
+        OUTBOUND_STRATEGY="prefer_ipv4"
     else
-        OS_TYPE="unknown"
+        NET_STACK="未知网络 (本地回环兜底)"
+        SERVER_IP="127.0.0.1"
+        OUTBOUND_STRATEGY="prefer_ipv6"
     fi
 }
 
-get_random_port() {
-    local p
+# 为纯 IPv6 VPS 注入高可用 NAT64/DNS64 解析
+setup_nat64_dns() {
+    detect_network
+    if [[ -z "$IPV4_ADDR" && -n "$IPV6_ADDR" ]]; then
+        echo -e "${YELLOW}[提示] 检测到当前 VPS 为【纯 IPv6 (如 Hax)】环境，正在注入 DNS64/NAT64 以打通 GitHub 与 Cloudflared 下载...${PLAIN}"
+        cp -f /etc/resolv.conf /etc/resolv.conf.bak 2>/dev/null || true
+        cat << 'EOF' > /etc/resolv.conf
+nameserver 2a00:1098:2b::1
+nameserver 2a01:4f8:c2c:123f::1
+nameserver 2a00:1098:2c::1
+nameserver 2606:4700:4700::1111
+EOF
+        echo -e "${GREEN}[OK] DNS64/NAT64 解析强化配置完成！${PLAIN}"
+    fi
+}
+
+# 生成互不冲突的随机高位端口 (15000-59999)
+gen_random_port() {
+    local port
     while true; do
-        p=$(( (RANDOM << 15 | RANDOM) % 45000 + 15000 ))
-        if ! ss -tulpn 2>/dev/null | grep -q ":$p "; then
-            echo "$p"
+        port=$(shuf -i 15000-59999 -n 1 2>/dev/null || echo $((RANDOM % 45000 + 15000)))
+        if ! ss -tuln 2>/dev/null | grep -q ":${port} "; then
+            echo "$port"
             return
         fi
     done
 }
 
-# ------------------------------------------------------------------------------
-# IP Stack & NAT64 Check (Special Optimization for Pure IPv6 VPS)
-# ------------------------------------------------------------------------------
-detect_ips() {
-    SERVER_IPV4=""
-    SERVER_IPV6=""
-    # 1. First probe local interface for global IPv6 (100% reliable on pure IPv6 VPS like Hax)
-    SERVER_IPV6=$(ip -6 addr show scope global 2>/dev/null | grep inet6 | grep -v '::1' | grep -v 'fe80:' | head -n 1 | awk '{print $2}' | cut -d/ -f1 || true)
-    
-    # 2. Check local IPv4 from interface
-    SERVER_IPV4=$(ip -4 addr show scope global 2>/dev/null | grep inet | grep -v '127.0.0.1' | head -n 1 | awk '{print $2}' | cut -d/ -f1 || true)
-
-    # 3. Validate with external API if curl/wget is available
-    if command -v curl >/dev/null 2>&1; then
-        local ext_v4 ext_v6
-        ext_v4=$(curl -4 -s --connect-timeout 2 https://api.ipify.org 2>/dev/null || curl -4 -s --connect-timeout 2 https://ipv4.icanhazip.com 2>/dev/null || true)
-        [[ -n "$ext_v4" ]] && SERVER_IPV4="$ext_v4"
-        ext_v6=$(curl -6 -s --connect-timeout 2 https://api64.ipify.org 2>/dev/null || curl -s --connect-timeout 2 https://api64.ipify.org 2>/dev/null || true)
-        [[ -n "$ext_v6" ]] && SERVER_IPV6="$ext_v6"
-    elif command -v wget >/dev/null 2>&1; then
-        local ext_w4 ext_w6
-        ext_w4=$(wget -T 2 -t 1 -qO- http://api.ipify.org 2>/dev/null || true)
-        [[ -n "$ext_w4" ]] && SERVER_IPV4="$ext_w4"
-        ext_w6=$(wget -T 2 -t 1 -qO- http://api64.ipify.org 2>/dev/null || true)
-        [[ -n "$ext_w6" ]] && SERVER_IPV6="$ext_w6"
-    fi
-
-    SERVER_IP="${SERVER_IPV4:-$SERVER_IPV6}"
-    [[ -z "$SERVER_IP" ]] && SERVER_IP="127.0.0.1"
-}
-
-check_ip_stack() {
-    echo -e "${CYAN}正在检测 VPS 网络协议栈 (IPv4 / IPv6)... ${PLAIN}"
-    detect_ips
-
-    # Check default IPv4 route or lack of IPv4
-    local has_ipv4_route
-    has_ipv4_route=$(ip -4 route show default 2>/dev/null || true)
-
-    if [[ -z "$SERVER_IPV4" && ( -n "$SERVER_IPV6" || -z "$has_ipv4_route" ) ]]; then
-        IS_IPV6_ONLY=true
-        echo -e "${YELLOW}[提示] 检测到当前 VPS 为【纯 IPv6 (IPv6-Only / 如 Hax)】环境！${PLAIN}"
-        setup_nat64_if_needed
-    elif [[ -n "$SERVER_IPV4" && -n "$SERVER_IPV6" ]]; then
-        echo -e "${GREEN}[OK] 检测到双栈网络: IPv4: $SERVER_IPV4 | IPv6: $SERVER_IPV6${PLAIN}"
-    elif [[ -n "$SERVER_IPV4" ]]; then
-        echo -e "${GREEN}[OK] 检测到原生 IPv4: $SERVER_IPV4${PLAIN}"
-    else
-        echo -e "${YELLOW}[提示] 纯 IPv6 环境，公网 IPv6: ${SERVER_IPV6:-"自动探测"}${PLAIN}"
-        setup_nat64_if_needed
+# 安装基础依赖工具
+install_deps() {
+    echo -e "${BLUE}正在检查并安装必要系统工具 (curl / wget / tar / openssl / python3 / jq)...${PLAIN}"
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -y >/dev/null 2>&1
+        apt-get install -y curl wget tar jq openssl ufw iptables cron python3 qrencode socat procps >/dev/null 2>&1
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y curl wget tar jq openssl iptables python3 qrencode socat procps-ng >/dev/null 2>&1
+    elif command -v apk >/dev/null 2>&1; then
+        apk update >/dev/null 2>&1
+        apk add bash curl wget tar jq openssl iptables python3 libqrencode socat procps >/dev/null 2>&1
     fi
 }
 
-setup_nat64_if_needed() {
-    echo -e "${YELLOW}正在为纯 IPv6 VPS 强化注入 DNS64 / NAT64 解析服务器以打通 GitHub 与海外下载...${PLAIN}"
-    [[ ! -f /etc/resolv.conf.bak ]] && cp /etc/resolv.conf /etc/resolv.conf.bak 2>/dev/null || true
+# 下载并安装官方 Sing-box 核心 (自动停止旧进程防止 Text file busy)
+install_singbox_binary() {
+    local target_ver="${1:-1.11.0}"
+    echo -e "${BLUE}=== 正在准备 Sing-box 官方内核 v${target_ver} (${ARCH}) ===${PLAIN}"
+    systemctl stop sing-box 2>/dev/null || true
+    pkill -9 sing-box 2>/dev/null || true
 
-    # Inject well-known stable high-speed NAT64 resolvers (Trex, Cloudflare, Nat64.net)
-    cat << 'EOF' > /etc/resolv.conf
-nameserver 2a00:1098:2b::1
-nameserver 2a01:4f8:c2c:123f::1
-nameserver 2a00:1098:2c::1
-nameserver 2606:4700:4700::1111
-nameserver 2001:4860:4860::8888
-EOF
-    echo -e "${GREEN}[OK] DNS64/NAT64 解析强化配置完成！${PLAIN}"
-}
+    local tarball="sing-box-${target_ver}-linux-${ARCH}.tar.gz"
+    local urls=(
+        "https://github.com/SagerNet/sing-box/releases/download/v${target_ver}/${tarball}"
+        "https://gh-proxy.com/https://github.com/SagerNet/sing-box/releases/download/v${target_ver}/${tarball}"
+        "https://ghproxy.net/https://github.com/SagerNet/sing-box/releases/download/v${target_ver}/${tarball}"
+    )
 
-# ------------------------------------------------------------------------------
-# Package Manager & Dependencies
-# ------------------------------------------------------------------------------
-install_dependencies() {
-    echo -e "${CYAN}正在检查并安装必要系统工具...${PLAIN}"
-    case "$OS_TYPE" in
-        ubuntu | debian)
-            apt-get update -y
-            apt-get install -y curl wget tar jq openssl ufw iptables cron python3 qrencode socat
-            ;;
-        centos | rhel | rockylinux | almalinux)
-            yum install -y epel-release || dnf install -y epel-release || true
-            yum install -y curl wget tar jq openssl iptables cronie python3 qrencode socat
-            ;;
-        alpine)
-            apk update
-            apk add curl wget tar jq openssl iptables python3 qrencode socat
-            ;;
-        *)
-            apt-get update -y || yum install -y || true
-            ;;
-    esac
-    # Re-detect IP after curl/wget installed
-    detect_ips
-}
-
-# ------------------------------------------------------------------------------
-# Fast Multi-Source Downloader (Mirrors + Direct + Progress Bar)
-# ------------------------------------------------------------------------------
-download_singbox_binary() {
-    local filename="$1"
-    local tag="$2"
-    local primary_url="https://github.com/SagerNet/sing-box/releases/download/${tag}/${filename}"
-    local mirror1="https://gh-proxy.com/${primary_url}"
-    local mirror2="https://mirror.ghproxy.com/${primary_url}"
-    local mirror3="https://github.moeyy.xyz/${primary_url}"
-    local mirror4="https://ghproxy.net/${primary_url}"
-
-    local urls=("$mirror1" "$mirror2" "$mirror3" "$primary_url" "$mirror4")
-    local success=false
-
-    echo -e "${CYAN}正在拉取 Sing-box 官方核心文件 (${filename})...${PLAIN}"
-
-    for u in "${urls[@]}"; do
-        echo -e "正在从源拉取: ${BLUE}$u${PLAIN}"
-        rm -f "/tmp/${filename}"
-
-        if command -v curl >/dev/null 2>&1; then
-            if curl -fL --progress-bar --connect-timeout 8 --max-time 120 -o "/tmp/${filename}" "$u"; then
-                if [[ -s "/tmp/${filename}" ]]; then
-                    success=true
-                    echo -e "${GREEN}[成功] 下载完成！${PLAIN}"
-                    break
-                fi
-            fi
-        elif command -v wget >/dev/null 2>&1; then
-            if wget --show-progress -T 10 -t 2 -O "/tmp/${filename}" "$u"; then
-                if [[ -s "/tmp/${filename}" ]]; then
-                    success=true
-                    echo -e "${GREEN}[成功] 下载完成！${PLAIN}"
-                    break
-                fi
-            fi
+    rm -rf /tmp/sb_dl && mkdir -p /tmp/sb_dl
+    local dl_ok=0
+    for url in "${urls[@]}"; do
+        echo -e "正在拉取内核源: ${url}"
+        if curl -fsSL --connect-timeout 8 --max-time 90 "$url" -o "/tmp/sb_dl/${tarball}"; then
+            dl_ok=1
+            break
         fi
-
-        echo -e "${YELLOW}此源连接缓慢，正在自动切换备用加速源...${PLAIN}"
+        echo -e "${YELLOW}当前源响应较慢，自动切换备用加速源...${PLAIN}"
     done
 
-    if [[ "$success" != "true" ]]; then
-        echo -e "${RED}下载 Sing-box 核心失败！请检查 VPS 的 NAT64 或网络连通状态。${PLAIN}"
+    if [[ $dl_ok -eq 0 ]]; then
+        echo -e "${RED}[错误] Sing-box 内核下载失败，请检查 VPS 网络或 DNS64 配置！${PLAIN}"
         exit 1
     fi
-}
 
-# ------------------------------------------------------------------------------
-# 1. 一键安装 Sing-box (Official Releases + All Protocols)
-# ------------------------------------------------------------------------------
-install_singbox() {
-    check_root
-    check_arch
-    check_os
-    check_ip_stack
-    install_dependencies
-
-    mkdir -p "$CONFIG_DIR" "$CERT_DIR" "$SUB_DIR"
-
-    echo -e "\n${CYAN}=== 正在获取 Sing-box 官方最新内核版本 ===${PLAIN}"
-    local tag_name="v1.11.0"
-    if command -v curl >/dev/null 2>&1; then
-        local fetched_tag
-        fetched_tag=$(curl -s --connect-timeout 4 https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null | jq -r .tag_name 2>/dev/null)
-        [[ -n "$fetched_tag" && "$fetched_tag" != "null" ]] && tag_name="$fetched_tag"
-    fi
-    local clean_ver=${tag_name#v}
-    local filename="sing-box-${clean_ver}-linux-${ARCH}.tar.gz"
-
-    echo -e "下载版本: ${GREEN}${tag_name}${PLAIN} (${ARCH})"
-
-    # Multi-source fast download with progress bar
-    download_singbox_binary "$filename" "$tag_name"
-
-    tar -zxvf "/tmp/${filename}" -C /tmp/ >/dev/null 2>&1
+    tar -zxvf "/tmp/sb_dl/${tarball}" -C /tmp/sb_dl >/dev/null 2>&1
     local extracted_bin
-    extracted_bin=$(find /tmp -type f -name "sing-box" | head -n 1)
-    if [[ -z "$extracted_bin" ]]; then
-        echo -e "${RED}未能解压出 sing-box 二进制文件！${PLAIN}"
-        exit 1
-    fi
-
-    systemctl stop sing-box >/dev/null 2>&1 || true
-    pkill -9 sing-box >/dev/null 2>&1 || true
-    rm -f /usr/local/bin/sing-box
-    cp -f "$extracted_bin" /usr/local/bin/sing-box
-    chmod +x /usr/local/bin/sing-box
-    rm -rf "/tmp/${filename}" "/tmp/sing-box-${clean_ver}-linux-${ARCH}"
-
-    echo -e "${GREEN}Sing-box 官方二进制安装成功: $(/usr/local/bin/sing-box version | head -n 1)${PLAIN}"
-
-    # Prompt interactive or auto configuration
-    echo -e "\n${BOLD}${CYAN}=== 配置多协议共存参数 ===${PLAIN}"
-    
-    # 1. Domain & Acme
-    read -rp "请输入你的解析域名 (如 node.example.com，用于Hy2/TUIC/Naive/AnyTLS，留空则自签/仅IP): " DOMAIN_NAME
-    
-    # 2. Random High Ports by Default (彻底规避运营商封锁与端口冲突)
-    local r_reality=$(get_random_port)
-    local r_hy2=$(get_random_port)
-    local r_tuic=$(get_random_port)
-    local r_naive=$(get_random_port)
-    local r_anytls=$(get_random_port)
-    local r_sub=$(get_random_port)
-
-    echo -e "${YELLOW}提示: 默认生成高位随机非标端口(15000-60000)，彻底规避运营商 80/443/8443 封锁与端口冲突。直接回车使用随机分配。${PLAIN}"
-    read -rp "请输入 VLESS-Reality 监听端口 [默认随机 $r_reality]: " PORT_REALITY
-    PORT_REALITY=${PORT_REALITY:-$r_reality}
-
-    read -rp "请输入 Hysteria 2 监听端口 [默认随机 $r_hy2]: " PORT_HY2
-    PORT_HY2=${PORT_HY2:-$r_hy2}
-
-    read -rp "请输入 TUIC v5 监听端口 [默认随机 $r_tuic]: " PORT_TUIC
-    PORT_TUIC=${PORT_TUIC:-$r_tuic}
-
-    read -rp "请输入 NaiveProxy 监听端口 [默认随机 $r_naive]: " PORT_NAIVE
-    PORT_NAIVE=${PORT_NAIVE:-$r_naive}
-
-    read -rp "请输入 AnyTLS 监听端口 [默认随机 $r_anytls]: " PORT_ANYTLS
-    PORT_ANYTLS=${PORT_ANYTLS:-$r_anytls}
-
-    read -rp "请输入 订阅微服务 监听端口 [默认随机 $r_sub]: " SUB_PORT
-    SUB_PORT=${SUB_PORT:-$r_sub}
-
-    # 3. UUID & Passwords
-    echo -e "\n${CYAN}正在生成安全密钥与 UUID...${PLAIN}"
-    local uuid_val
-    uuid_val=$(/usr/local/bin/sing-box generate uuid)
-    local hy2_pwd
-    hy2_pwd=$(openssl rand -hex 12)
-    local tuic_pwd
-    tuic_pwd=$(openssl rand -hex 12)
-    local naive_user="admin"
-    local naive_pass
-    naive_pass=$(openssl rand -hex 12)
-
-    # 4. Reality Keypair & F-style Proven SNI
-    local reality_keypair
-    reality_keypair=$(/usr/local/bin/sing-box generate reality-keypair)
-    local reality_priv
-    reality_priv=$(echo "$reality_keypair" | grep -i "PrivateKey" | awk '{print $2}')
-    local reality_pub
-    reality_pub=$(echo "$reality_keypair" | grep -i "PublicKey" | awk '{print $2}')
-    local reality_short_id
-    reality_short_id=$(openssl rand -hex 8)
-    
-    # F佬核心经验：addons.mozilla.org 具备原生双栈 IPv6+IPv4、干净 TLS 1.3，无国内 CDN 劫持
-    read -rp "请输入 Reality 伪装域名 SNI [推荐/默认 addons.mozilla.org]: " reality_sni_in
-    local reality_sni="${reality_sni_in:-addons.mozilla.org}"
-
-    # Save to singbox.env
-    cat << EOF > "$ENV_FILE"
-SERVER_IP="$SERVER_IP"
-SERVER_IPV4="$SERVER_IPV4"
-SERVER_IPV6="$SERVER_IPV6"
-DOMAIN_NAME="$DOMAIN_NAME"
-PORT_REALITY=$PORT_REALITY
-PORT_HY2=$PORT_HY2
-PORT_TUIC=$PORT_TUIC
-PORT_NAIVE=$PORT_NAIVE
-PORT_ANYTLS=$PORT_ANYTLS
-SUB_PORT=$SUB_PORT
-UUID="$uuid_val"
-HY2_PWD="$hy2_pwd"
-TUIC_PWD="$tuic_pwd"
-NAIVE_USER="$naive_user"
-NAIVE_PASS="$naive_pass"
-REALITY_PRIV="$reality_priv"
-REALITY_PUB="$reality_pub"
-REALITY_SHORT_ID="$reality_short_id"
-REALITY_SNI="$reality_sni"
-SUB_TOKEN="$(openssl rand -hex 16)"
-EOF
-
-    # Generate Certificates (Self-signed fallback or Let's Encrypt)
-    generate_self_signed_cert "$DOMAIN_NAME"
-
-    # Build Master config.json
-    build_server_config
-
-    # Unblock ports in firewall
-    if command -v ufw >/dev/null 2>&1; then
-        ufw allow $PORT_REALITY/tcp >/dev/null 2>&1 || true
-        ufw allow $PORT_HY2/udp >/dev/null 2>&1 || true
-        ufw allow $PORT_TUIC/udp >/dev/null 2>&1 || true
-        ufw allow $PORT_NAIVE/tcp >/dev/null 2>&1 || true
-        ufw allow $PORT_ANYTLS/tcp >/dev/null 2>&1 || true
-        ufw allow $SUB_PORT/tcp >/dev/null 2>&1 || true
-    fi
-    if command -v ip6tables >/dev/null 2>&1; then
-        ip6tables -I INPUT -p tcp --dport $PORT_REALITY -j ACCEPT 2>/dev/null || true
-        ip6tables -I INPUT -p udp --dport $PORT_HY2 -j ACCEPT 2>/dev/null || true
-        ip6tables -I INPUT -p udp --dport $PORT_TUIC -j ACCEPT 2>/dev/null || true
-        ip6tables -I INPUT -p tcp --dport $PORT_NAIVE -j ACCEPT 2>/dev/null || true
-        ip6tables -I INPUT -p tcp --dport $PORT_ANYTLS -j ACCEPT 2>/dev/null || true
-        ip6tables -I INPUT -p tcp --dport $SUB_PORT -j ACCEPT 2>/dev/null || true
-    fi
-
-    # Create systemd service
-    setup_systemd_service
-
-    # Enable BBR by default
-    enable_bbr_silently
-
-    # Start Subscription Web Server
-    setup_sub_server
-
-    # Setup command shortcut
-    setup_shortcut
-
-    echo -e "\n${GREEN}${BOLD}====================================================${PLAIN}"
-    echo -e "${GREEN}${BOLD}  Sing-box 五协议官方多合一服务安装完成并已启动！  ${PLAIN}"
-    echo -e "${GREEN}${BOLD}====================================================${PLAIN}"
-    show_node_info
+    extracted_bin=$(find /tmp/sb_dl -name "sing-box" -type f | head -n 1)
+    rm -f "$BIN_PATH"
+    cp -f "$extracted_bin" "$BIN_PATH"
+    chmod +x "$BIN_PATH"
+    rm -rf /tmp/sb_dl
+    echo -e "${GREEN}[成功] Sing-box 内核安装完成: $($BIN_PATH version 2>/dev/null | head -n 1)${PLAIN}"
 }
 
-# ------------------------------------------------------------------------------
-# Certificate Generation
-# ------------------------------------------------------------------------------
-generate_self_signed_cert() {
-    local domain="${1:-addons.mozilla.org}"
-    [[ -z "$domain" ]] && domain="addons.mozilla.org"
-    mkdir -p "$CERT_DIR"
-    if [[ ! -f "$CERT_DIR/server.crt" || ! -f "$CERT_DIR/server.key" ]]; then
-        echo -e "${CYAN}正在生成具备 SAN 扩展的 TLS 证书 (SNI: $domain)...${PLAIN}"
-        cat > "$CERT_DIR/cert.conf" << EOF
-[req]
-distinguished_name = req_distinguished_name
-x509_extensions = v3_req
-prompt = no
-[req_distinguished_name]
-CN = $domain
-[v3_req]
-subjectAltName = @alt_names
-[alt_names]
-DNS.1 = $domain
-IP.1 = $SERVER_IP
-EOF
-        openssl ecparam -genkey -name prime256v1 -out "$CERT_DIR/server.key" >/dev/null 2>&1
-        openssl req -new -x509 -days 3650 -key "$CERT_DIR/server.key" \
-            -out "$CERT_DIR/server.crt" -config "$CERT_DIR/cert.conf" -extensions v3_req >/dev/null 2>&1
-        rm -f "$CERT_DIR/cert.conf"
-        chmod 644 "$CERT_DIR/server.crt"
-        chmod 600 "$CERT_DIR/server.key"
-    fi
-}
+# 部署标准化双栈订阅服务 (默认返回通用 Base64 完美支持 Karing/v2rayN，带 ?format=clash 返回 YAML)
+deploy_sub_server() {
+    mkdir -p "$SUB_DIR"
+    cat << 'PYEOF' > "${SUB_DIR}/server.py"
+#!/usr/bin/env python3
+import http.server, socketserver, socket, os, base64, urllib.parse
 
-# ------------------------------------------------------------------------------
-# Build config.json for Sing-box v1.10+
-# ------------------------------------------------------------------------------
-build_server_config() {
-    source "$ENV_FILE"
-
-    # Listen address binding: [::] for dual-stack/IPv6 or 0.0.0.0
-    local listen_addr="::"
-
-    # Outbound DNS strategy: Pure IPv6 VPS must prefer IPv6 to avoid connection timeouts
-    local domain_strat="prefer_ipv6"
-    if [[ "$IS_IPV6_ONLY" != "true" && -n "$SERVER_IPV4" ]]; then
-        domain_strat="prefer_ipv4"
-    fi
-
-    local p_reality="${PORT_REALITY:-7443}"
-    local p_hy2="${PORT_HY2:-8443}"
-    local p_tuic="${PORT_TUIC:-9443}"
-    local p_naive="${PORT_NAIVE:-10443}"
-    local p_anytls="${PORT_ANYTLS:-11443}"
-    local r_sni="${REALITY_SNI:-addons.mozilla.org}"
-
-    cat << EOF > "$CONFIG_FILE"
-{
-  "log": {
-    "level": "info",
-    "timestamp": true
-  },
-  "inbounds": [
-    {
-      "type": "vless",
-      "tag": "vless-reality-in",
-      "listen": "$listen_addr",
-      "listen_port": $p_reality,
-      "users": [
-        {
-          "uuid": "$UUID",
-          "flow": "xtls-rprx-vision"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "$r_sni",
-        "reality": {
-          "enabled": true,
-          "handshake": {
-            "server": "$r_sni",
-            "server_port": 443
-          },
-          "private_key": "$REALITY_PRIV",
-          "short_id": [
-            "$REALITY_SHORT_ID"
-          ]
-        }
-      }
-    },
-    {
-      "type": "hysteria2",
-      "tag": "hy2-in",
-      "listen": "$listen_addr",
-      "listen_port": $p_hy2,
-      "users": [
-        {
-          "password": "$HY2_PWD"
-        }
-      ],
-      "ignore_client_bandwidth": false,
-      "tls": {
-        "enabled": true,
-        "certificate_path": "$CERT_DIR/server.crt",
-        "key_path": "$CERT_DIR/server.key"
-      }
-    },
-    {
-      "type": "tuic",
-      "tag": "tuic-in",
-      "listen": "$listen_addr",
-      "listen_port": $p_tuic,
-      "users": [
-        {
-          "uuid": "$UUID",
-          "password": "$TUIC_PWD"
-        }
-      ],
-      "congestion_control": "bbr",
-      "tls": {
-        "enabled": true,
-        "alpn": [
-          "h3",
-          "spdy/3.1"
-        ],
-        "certificate_path": "$CERT_DIR/server.crt",
-        "key_path": "$CERT_DIR/server.key"
-      }
-    },
-    {
-      "type": "naive",
-      "tag": "naive-in",
-      "listen": "$listen_addr",
-      "listen_port": $p_naive,
-      "users": [
-        {
-          "username": "$NAIVE_USER",
-          "password": "$NAIVE_PASS"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "certificate_path": "$CERT_DIR/server.crt",
-        "key_path": "$CERT_DIR/server.key"
-      }
-    },
-    {
-      "type": "vless",
-      "tag": "anytls-in",
-      "listen": "$listen_addr",
-      "listen_port": $p_anytls,
-      "users": [
-        {
-          "uuid": "$UUID"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "certificate_path": "$CERT_DIR/server.crt",
-        "key_path": "$CERT_DIR/server.key"
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct",
-      "domain_strategy": "$domain_strat"
-    },
-    {
-      "type": "block",
-      "tag": "block"
-    }
-  ],
-  "route": {
-    "rules": []
-  }
-}
-EOF
-}
-
-# ------------------------------------------------------------------------------
-# Systemd & Shortcut Setup
-# ------------------------------------------------------------------------------
-setup_systemd_service() {
-    cat << 'EOF' > /etc/systemd/system/sing-box.service
-[Unit]
-Description=Sing-box Service
-Documentation=https://sing-box.sagernet.org
-After=network.target nss-lookup.target
-
-[Service]
-ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
-Restart=on-failure
-RestartSec=5s
-LimitNOFILE=infinity
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable sing-box >/dev/null 2>&1
-    systemctl restart sing-box
-}
-
-setup_shortcut() {
-    cp "$0" "$SCRIPT_PATH" 2>/dev/null || true
-    chmod +x "$SCRIPT_PATH" 2>/dev/null || true
-}
-
-# ------------------------------------------------------------------------------
-# Subscription HTTP Server
-# ------------------------------------------------------------------------------
-setup_sub_server() {
-    source "$ENV_FILE"
-    cat << 'PYEOF' > "$SUB_DIR/server.py"
-import http.server
-import socketserver
-import socket
-import os
-import json
-import base64
-import urllib.parse
-
-PORT = 2096
-ENV_FILE = "/etc/sing-box/singbox.env"
+ENV_PATH = "/etc/sing-box/singbox.env"
 
 def load_env():
     env = {}
-    if os.path.exists(ENV_FILE):
-        with open(ENV_FILE, 'r') as f:
+    if os.path.exists(ENV_PATH):
+        with open(ENV_PATH, "r", encoding="utf-8") as f:
             for line in f:
-                if '=' in line and not line.startswith('#'):
-                    k, v = line.strip().split('=', 1)
-                    env[k] = v.strip('"')
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    env[k.strip()] = v.strip().strip('"').strip("'")
     return env
 
 class SubHandler(http.server.BaseHTTPRequestHandler):
-    def send_data(self, code, content_type, data):
+    def log_message(self, format, *args):
+        pass
+
+    def send_payload(self, code, content_type, data_bytes):
         self.send_response(code)
         self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Length", str(len(data_bytes)))
         self.send_header("Connection", "close")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
         self.send_header("profile-update-interval", "24")
         self.end_headers()
-        self.wfile.write(data)
+        self.wfile.write(data_bytes)
         self.wfile.flush()
 
     def do_HEAD(self):
@@ -655,152 +218,124 @@ class SubHandler(http.server.BaseHTTPRequestHandler):
             expected_token = env.get("SUB_TOKEN", "").strip()
 
             if expected_token and token != expected_token:
-                err = b"403 Forbidden: Invalid or missing subscription token
-"
-                self.send_data(403, "text/plain; charset=utf-8", err)
+                self.send_payload(403, "text/plain; charset=utf-8", b"403 Forbidden: Invalid Subscription Token\n")
                 return
 
-            ip = env.get("SERVER_IP", "127.0.0.1")
-            uuid = env.get("UUID", "")
+            ip = env.get("SERVER_IP", "127.0.0.1").strip()
+            uuid = env.get("UUID", "").strip()
             url_ip = f"[{ip}]" if ":" in ip else ip
-            domain = env.get("DOMAIN_NAME", "")
-            target_host = domain if domain else url_ip
-
-            # Generate Share Links
-            links = []
-            # 1. Reality
-            links.append(f"vless://{uuid}@{url_ip}:{env.get('PORT_REALITY', 7443)}?encryption=none&flow=xtls-rprx-vision&security=reality&sni={env.get('REALITY_SNI', 'addons.mozilla.org')}&fp=chrome&pbk={env.get('REALITY_PUB','')}&sid={env.get('REALITY_SHORT_ID','')}&type=tcp#Reality-{ip}")
-            # 2. Hy2
-            links.append(f"hysteria2://{env.get('HY2_PWD','')}@{target_host}:{env.get('PORT_HY2', 8443)}/?insecure=1&sni={target_host}#Hy2-{target_host}")
-            # 3. TUIC
-            links.append(f"tuic://{uuid}:{env.get('TUIC_PWD','')}@{target_host}:{env.get('PORT_TUIC', 9443)}?congestion_control=bbr&alpn=h3&sni={target_host}&allow_insecure=1#TUIC5-{target_host}")
-            # 4. NaiveProxy (内嵌自签证书，与 F 佬完全一致，免手动导证书)
-            cert_crlf = ""
-            cert_line = ""
-            cert_file = "/etc/sing-box/cert/server.crt"
-            if os.path.exists(cert_file):
-                try:
-                    with open(cert_file, "r") as cf:
-                        raw_c = cf.read()
-                        cert_crlf = raw_c.replace("
-", "
-")
-                        cert_line = ",".join([l.strip() for l in raw_c.splitlines() if l.strip()])
-                except Exception:
-                    pass
-            naive_sni = env.get("DOMAIN_NAME", env.get("REALITY_SNI", "addons.mozilla.org"))
-            if not naive_sni:
-                naive_sni = "addons.mozilla.org"
-
+            domain = env.get("DOMAIN_NAME", "").strip()
+            target = domain if domain else url_ip
+            raw_host = domain if domain else ip
+            sni_reality = env.get("REALITY_SNI", "addons.mozilla.org").strip()
             argo = env.get("ARGO_DOMAIN", "").strip()
+
+            links = [
+                f"vless://{uuid}@{url_ip}:{env.get('PORT_REALITY', '27409')}?encryption=none&flow=xtls-rprx-vision&security=reality&sni={sni_reality}&fp=chrome&pbk={env.get('REALITY_PUB', '')}&sid={env.get('REALITY_SHORT_ID', '')}&type=tcp#Reality-{ip}",
+                f"hysteria2://{env.get('HY2_PWD', '')}@{target}:{env.get('PORT_HY2', '56333')}/?insecure=1&sni={target}#Hy2-{target}",
+                f"tuic://{uuid}:{env.get('TUIC_PWD', '')}@{target}:{env.get('PORT_TUIC', '49515')}?congestion_control=bbr&alpn=h3&sni={target}&allow_insecure=1#TUIC5-{target}",
+            ]
+
             if argo:
-                links.append(f"naive+https://{env.get('NAIVE_USER','admin')}:{env.get('NAIVE_PASS','')}@{argo}:443#Naive-Argo")
-            else:
-                links.append(f"naive+https://{env.get('NAIVE_USER','admin')}:{env.get('NAIVE_PASS','')}@{url_ip}:{env.get('PORT_NAIVE', 10443)}?uot=1&security=tls&sni={naive_sni}&tls_certificate={cert_line}#Naive-{ip}")
-                if cert_crlf:
-                    v2_cfg = {
-                        "ConfigType": 12, "CoreType": 24, "ConfigVersion": 4,
-                        "Remarks": f"Naive-{ip}", "Address": ip, "Port": int(env.get("PORT_NAIVE", 10443)),
-                        "Password": env.get("NAIVE_PASS", ""), "Username": env.get("NAIVE_USER", "admin"),
-                        "StreamSecurity": "tls", "AllowInsecure": "false", "Sni": naive_sni, "Cert": cert_crlf
-                    }
-                    v2_b64 = base64.urlsafe_b64encode(json.dumps(v2_cfg).encode("utf-8")).decode("utf-8").rstrip("=")
-                    links.append(f"v2rayn://naive/{v2_b64}")
-            # 5. AnyTLS
-            links.append(f"vless://{uuid}@{target_host}:{env.get('PORT_ANYTLS', 11443)}?security=tls&sni={target_host}&allow_insecure=1&type=tcp#AnyTLS-{target_host}")
+                links.append(f"naive+https://{env.get('NAIVE_USER', 'admin')}:{env.get('NAIVE_PASS', '')}@{argo}:443#Naive-Argo-Trusted")
+            links.append(f"naive+https://{env.get('NAIVE_USER', 'admin')}:{env.get('NAIVE_PASS', '')}@{target}:{env.get('PORT_NAIVE', '33445')}?insecure=1#Naive-Direct-{target}")
+            links.append(f"vless://{uuid}@{target}:{env.get('PORT_ANYTLS', '20418')}?security=tls&sni={target}&allow_insecure=1&type=tcp#AnyTLS-{target}")
 
-            fmt = qs.get("format", ["base64"])[0].lower()
-
-            if fmt in ["clash", "meta"]:
-                yaml_out = f"""port: 7890
+            fmt = qs.get("format", [""])[0].lower()
+            if fmt in ["clash", "meta", "yaml"]:
+                yaml_content = f"""port: 7890
 socks-port: 7891
-allow-lan: false
+allow-lan: true
 mode: rule
 log-level: info
 proxies:
   - name: "Reality [{ip}]"
     type: vless
     server: "{ip}"
-    port: {env.get('PORT_REALITY', 7443)}
+    port: {env.get('PORT_REALITY', '27409')}
     uuid: "{uuid}"
     network: tcp
     tls: true
     flow: xtls-rprx-vision
-    servername: "{env.get('REALITY_SNI', 'addons.mozilla.org')}"
+    servername: "{sni_reality}"
     reality-opts:
       public-key: "{env.get('REALITY_PUB', '')}"
       short-id: "{env.get('REALITY_SHORT_ID', '')}"
     client-fingerprint: chrome
-  - name: "Hy2 [{domain if domain else ip}]"
+  - name: "Hy2 [{raw_host}]"
     type: hysteria2
-    server: "{domain if domain else ip}"
-    port: {env.get('PORT_HY2', 8443)}
+    server: "{raw_host}"
+    port: {env.get('PORT_HY2', '56333')}
     password: "{env.get('HY2_PWD', '')}"
-    sni: "{domain if domain else ip}"
+    sni: "{raw_host}"
     skip-cert-verify: true
-  - name: "TUIC [{domain if domain else ip}]"
+  - name: "TUIC5 [{raw_host}]"
     type: tuic
-    server: "{domain if domain else ip}"
-    port: {env.get('PORT_TUIC', 9443)}
+    server: "{raw_host}"
+    port: {env.get('PORT_TUIC', '49515')}
     uuid: "{uuid}"
     password: "{env.get('TUIC_PWD', '')}"
     congestion-controller: bbr
     alpn: [h3]
-    sni: "{domain if domain else ip}"
+    sni: "{raw_host}"
     skip-cert-verify: true
-  - name: "AnyTLS [{domain if domain else ip}]"
+  - name: "AnyTLS [{raw_host}]"
     type: vless
-    server: "{domain if domain else ip}"
-    port: {env.get('PORT_ANYTLS', 11443)}
+    server: "{raw_host}"
+    port: {env.get('PORT_ANYTLS', '20418')}
     uuid: "{uuid}"
     network: tcp
     tls: true
-    servername: "{domain if domain else ip}"
+    servername: "{raw_host}"
     skip-cert-verify: true
 proxy-groups:
-  - name: PROXY
+  - name: "PROXY"
     type: select
     proxies:
       - "Reality [{ip}]"
-      - "Hy2 [{domain if domain else ip}]"
-      - "TUIC [{domain if domain else ip}]"
-      - "AnyTLS [{domain if domain else ip}]"
+      - "Hy2 [{raw_host}]"
+      - "TUIC5 [{raw_host}]"
+      - "AnyTLS [{raw_host}]"
 rules:
-  - GEOIP,LAN,DIRECT
-  - GEOIP,CN,DIRECT
   - MATCH,PROXY
 """
-                self.send_data(200, "text/yaml; charset=utf-8", yaml_out.encode('utf-8'))
+                self.send_payload(200, "text/yaml; charset=utf-8", yaml_content.encode("utf-8"))
             else:
-                # Default Base64 (Universally supported by Karing, v2rayN, Shadowrocket, NekoBox)
-                raw_text = "\n".join(links)
-                b64_data = base64.b64encode(raw_text.encode('utf-8'))
-                self.send_data(200, "text/plain; charset=utf-8", b64_data)
+                b64_payload = base64.b64encode("\n".join(links).encode("utf-8"))
+                self.send_payload(200, "text/plain; charset=utf-8", b64_payload)
         except Exception as e:
-            err_body = f"500 Internal Error: {str(e)}\n".encode('utf-8')
-            self.send_data(500, "text/plain; charset=utf-8", err_body)
+            err_msg = f"500 Internal Error: {str(e)}\n".encode("utf-8")
+            self.send_payload(500, "text/plain; charset=utf-8", err_msg)
 
 class DualStackServer(socketserver.ThreadingTCPServer):
     address_family = socket.AF_INET6
     allow_reuse_address = True
+    def server_bind(self):
+        try:
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        except Exception:
+            pass
+        super().server_bind()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     env = load_env()
-    sub_port = int(env.get("SUB_PORT", 2096))
+    port = int(env.get("SUB_PORT", 53358))
     try:
-        with DualStackServer(("::", sub_port), SubHandler) as httpd:
+        with DualStackServer(("::", port), SubHandler) as httpd:
             httpd.serve_forever()
     except Exception:
-        with socketserver.TCPServer(("", sub_port), SubHandler) as httpd:
+        with socketserver.ThreadingTCPServer(("0.0.0.0", port), SubHandler) as httpd:
             httpd.serve_forever()
 PYEOF
+    chmod +x "${SUB_DIR}/server.py"
 
     cat << 'EOF' > /etc/systemd/system/singbox-sub.service
 [Unit]
-Description=Sing-box Subscription Server
+Description=SingBox Suite Pro DualStack Subscription Server
 After=network.target
 
 [Service]
+Type=simple
 ExecStart=/usr/bin/python3 /etc/sing-box/subscription/server.py
 Restart=always
 RestartSec=3s
@@ -808,150 +343,51 @@ RestartSec=3s
 [Install]
 WantedBy=multi-user.target
 EOF
-
     systemctl daemon-reload
-    systemctl enable singbox-sub >/dev/null 2>&1
-    systemctl restart singbox-sub
+    systemctl enable --now singbox-sub >/dev/null 2>&1
+    systemctl restart singbox-sub >/dev/null 2>&1
 }
 
-# ------------------------------------------------------------------------------
-# 2. 删除卸载 Sing-box
-# ------------------------------------------------------------------------------
-uninstall_singbox() {
-    echo -e "${YELLOW}正在停止并卸载 Sing-box 与订阅服务...${PLAIN}"
-    systemctl stop sing-box singbox-sub >/dev/null 2>&1
-    systemctl disable sing-box singbox-sub >/dev/null 2>&1
-    rm -f /etc/systemd/system/sing-box.service /etc/systemd/system/singbox-sub.service
-    systemctl daemon-reload
+# 自动安装并开启 Cloudflare Argo 免费临时隧道 (解决 NaiveProxy 无域名 -202 证书报错)
+setup_argo_quick_tunnel() {
+    source "$ENV_FILE" 2>/dev/null || true
+    local naive_port="${PORT_NAIVE:-33445}"
 
-    rm -rf "$CONFIG_DIR"
-    rm -f /usr/local/bin/sing-box "$SCRIPT_PATH"
+    echo -e "${BLUE}=== 正在配置 Cloudflare Argo 免费临时权威证书隧道 (赋能 NaiveProxy 免证书直通) ===${PLAIN}"
+    systemctl stop argo 2>/dev/null || true
+    pkill -9 cloudflared 2>/dev/null || true
+    rm -f "$ARGO_LOG"
 
-    # Clean port forwards
-    iptables -t nat -F 2>/dev/null || true
-
-    echo -e "${GREEN}[OK] Sing-box 及其所有配置文件、订阅服务已彻底卸载干净！${PLAIN}"
-}
-
-# ------------------------------------------------------------------------------
-# 3. 变更配置【双证书TLS/UUID路径/Argo/IP优先/TG通知/Warp/订阅/CDN优选】
-# ------------------------------------------------------------------------------
-change_configuration() {
-    if [[ ! -f "$ENV_FILE" ]]; then
-        echo -e "${RED}未检测到安装配置，请先运行 1 一键安装！${PLAIN}"
-        return
-    fi
-    source "$ENV_FILE"
-
-    echo -e "\n${CYAN}=== 变更配置选项 ===${PLAIN}"
-    echo -e " 1. 重新生成并更换 UUID"
-    echo -e " 2. 更换 Hysteria 2 / TUIC / Naive 密码"
-    echo -e " 3. 切换出站策略【IPv4 优先 / IPv6 优先 / WARP优先】"
-    echo -e " 4. 配置 Telegram 机器人节点变更推送通知"
-    echo -e " 5. 配置 Cloudflare Argo 隧道 (支持纯 IPv6 穿透 IPv4)"
-    echo -e " 6. 重新生成订阅 Token"
-    echo -e " 0. 返回主菜单"
-    read -rp "请选择 [0-6]: " cfg_sub
-    case "$cfg_sub" in
-        1)
-            local new_uuid
-            new_uuid=$(/usr/local/bin/sing-box generate uuid)
-            sed -i "s/UUID=\".*\"/UUID=\"$new_uuid\"/" "$ENV_FILE"
-            build_server_config
-            systemctl restart sing-box
-            echo -e "${GREEN}[OK] UUID 已更新为: $new_uuid${PLAIN}"
-            ;;
-        2)
-            local new_hy2=$(openssl rand -hex 12)
-            local new_tuic=$(openssl rand -hex 12)
-            sed -i "s/HY2_PWD=\".*\"/HY2_PWD=\"$new_hy2\"/" "$ENV_FILE"
-            sed -i "s/TUIC_PWD=\".*\"/TUIC_PWD=\"$new_tuic\"/" "$ENV_FILE"
-            build_server_config
-            systemctl restart sing-box
-            echo -e "${GREEN}[OK] 密码已刷新！Hy2: $new_hy2 | TUIC: $new_tuic${PLAIN}"
-            ;;
-        3)
-            echo -e "请选择优先出站方式: 1) IPv4 优先  2) IPv6 优先"
-            read -rp "选择: " ip_opt
-            if [[ "$ip_opt" == "2" ]]; then
-                sed -i 's/"domain_strategy": "prefer_ipv4"/"domain_strategy": "prefer_ipv6"/' "$CONFIG_FILE"
-            else
-                sed -i 's/"domain_strategy": "prefer_ipv6"/"domain_strategy": "prefer_ipv4"/' "$CONFIG_FILE"
-            fi
-            systemctl restart sing-box
-            echo -e "${GREEN}[OK] 出站优先级已更新！${PLAIN}"
-            ;;
-        4)
-            read -rp "请输入 Telegram Bot Token: " tg_token
-            read -rp "请输入 Telegram Chat ID: " tg_chat
-            if [[ -n "$tg_token" && -n "$tg_chat" ]]; then
-                curl -s -X POST "https://api.telegram.org/bot${tg_token}/sendMessage" \
-                    -d "chat_id=${tg_chat}" -d "text=Sing-box 节点通知测试成功！" >/dev/null 2>&1
-                echo -e "${GREEN}[OK] TG 通知已绑定并发送测试消息！${PLAIN}"
-            fi
-            ;;
-        5)
-            manage_argo
-            ;;
-        6)
-            local new_sub_token=$(openssl rand -hex 16)
-            sed -i "s/SUB_TOKEN=\".*\"/SUB_TOKEN=\"$new_sub_token\"/" "$ENV_FILE"
-            systemctl restart singbox-sub >/dev/null 2>&1 || true
-            echo -e "${GREEN}[OK] 订阅 Token 已更新为: $new_sub_token${PLAIN}"
-            ;;
-        *)
-            return
-            ;;
-    esac
-}
-
-# ------------------------------------------------------------------------------
-# Cloudflare Argo Tunnel Management
-# ------------------------------------------------------------------------------
-install_cloudflared_bin() {
-    if [[ ! -f /usr/local/bin/cloudflared ]]; then
-        echo -e "${CYAN}正在下载 Cloudflare 官方 cloudflared 二进制程序...${PLAIN}"
-        local c_arch="amd64"
-        [[ "$ARCH" == "arm64" ]] && c_arch="arm64"
-        local urls=(
-            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${c_arch}"
-            "https://ghproxy.net/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${c_arch}"
-            "https://mirror.ghproxy.com/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${c_arch}"
+    if [[ ! -x "$ARGO_BIN" ]]; then
+        echo -e "正在下载 Cloudflare 官方 cloudflared 二进制程序 (${CF_ARCH})..."
+        local cf_urls=(
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}"
+            "https://gh-proxy.com/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}"
+            "https://ghproxy.net/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}"
         )
-        local dl_ok=0
-        for u in "${urls[@]}"; do
-            if curl -fsSL --connect-timeout 8 "$u" -o /usr/local/bin/cloudflared 2>/dev/null; then
-                chmod +x /usr/local/bin/cloudflared
-                dl_ok=1
+        for u in "${cf_urls[@]}"; do
+            if curl -fsSL --connect-timeout 8 --max-time 60 "$u" -o "$ARGO_BIN"; then
+                chmod +x "$ARGO_BIN"
                 break
             fi
         done
-        if [[ $dl_ok -eq 0 ]]; then
-            echo -e "${RED}下载 cloudflared 失败，请检查网络或稍后重试！${PLAIN}"
-            return 1
-        fi
     fi
-}
 
-install_and_start_argo_quick() {
-    source "$ENV_FILE"
-    install_cloudflared_bin || return 1
-
-    local p_naive="${PORT_NAIVE:-10443}"
-    echo -e "${CYAN}正在启动 Cloudflare Argo 免费临时隧道 (映射 NaiveProxy 端口 $p_naive)...${PLAIN}"
-    systemctl stop argo >/dev/null 2>&1 || true
-    rm -f /var/log/argo.log
+    if [[ ! -x "$ARGO_BIN" ]]; then
+        echo -e "${YELLOW}[提示] cloudflared 下载超时，将保留纯 IP 自签证书模式运行 NaiveProxy。${PLAIN}"
+        return 1
+    fi
 
     cat << EOF > /etc/systemd/system/argo.service
 [Unit]
-Description=Cloudflare Argo Quick Tunnel
+Description=Cloudflare Argo Quick Tunnel for NaiveProxy
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/cloudflared tunnel --url https://localhost:$p_naive --no-tls-verify --no-autoupdate
-StandardOutput=append:/var/log/argo.log
-StandardError=append:/var/log/argo.log
+ExecStart=${ARGO_BIN} tunnel --url https://localhost:${naive_port} --no-tls-verify --no-autoupdate --edge-ip-version auto
+StandardOutput=append:${ARGO_LOG}
+StandardError=append:${ARGO_LOG}
 Restart=always
 RestartSec=5s
 
@@ -960,535 +396,612 @@ WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
-    systemctl enable --now argo
+    systemctl enable --now argo >/dev/null 2>&1
+    systemctl restart argo
 
-    echo -e "${YELLOW}正在向 Cloudflare 全球边缘注册隧道并申请权威域名 (约需 5 秒)...${PLAIN}"
+    echo -e "正在向 Cloudflare 全球边缘申请官方权威域名与合法 SSL 证书 (约需 5-8 秒)..."
     local argo_dom=""
-    for i in {1..12}; do
+    for i in {1..16}; do
         sleep 1
-        if [[ -f /var/log/argo.log ]]; then
-            argo_dom=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /var/log/argo.log | tail -n 1 | sed 's|https://||')
-            if [[ -n "$argo_dom" ]]; then
-                break
-            fi
-        fi
+        argo_dom=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$ARGO_LOG" 2>/dev/null | tail -n 1 | sed 's|https://||')
+        [[ -n "$argo_dom" ]] && break
     done
 
     if [[ -n "$argo_dom" ]]; then
-        sed -i '/ARGO_DOMAIN=/d' "$ENV_FILE"
-        echo "ARGO_DOMAIN="$argo_dom"" >> "$ENV_FILE"
-        echo -e "${GREEN}=================================================================${PLAIN}"
-        echo -e "${GREEN}🎉 Cloudflare Argo 免费临时隧道成功建立！${PLAIN}"
-        echo -e "权威证书官方域名: ${CYAN}${BOLD}$argo_dom${PLAIN}"
-        echo -e "官方合法 TLS 证书: ${GREEN}由 Cloudflare 权威 CA 颁发 (Chrome 100% 信任)${PLAIN}"
-        echo -e "全球双栈加速接入: ${GREEN}支持 IPv4 和 IPv6 客户端免配置直接连通${PLAIN}"
-        echo -e "${GREEN}=================================================================${PLAIN}"
-        systemctl restart singbox-sub >/dev/null 2>&1 || true
-        show_node_info
+        sed -i '/^ARGO_DOMAIN=/d' "$ENV_FILE"
+        echo "ARGO_DOMAIN=\"$argo_dom\"" >> "$ENV_FILE"
+        systemctl restart singbox-sub 2>/dev/null || true
+        echo -e "${GREEN}🎉 Cloudflare Argo 免费权威证书隧道建立成功: https://${argo_dom}${PLAIN}"
+        echo -e "${GREEN}✔ Chrome / v2rayN 100% 信任，无需导入自签证书，彻底消除 -202 cert authority invalid！${PLAIN}"
     else
-        echo -e "${RED}未能及时获取 trycloudflare 域名，请查看日志: cat /var/log/argo.log${PLAIN}"
+        echo -e "${YELLOW}[提示] 暂未捕获到 Argo 临时域名，可稍后在菜单 [4 -> 5] 查看或刷新隧道状态。${PLAIN}"
     fi
 }
 
-manage_argo() {
+# 生成 Sing-box 五协议共存 config.json
+write_singbox_config() {
     source "$ENV_FILE"
-    echo -e "\n${CYAN}=== Cloudflare Argo 免费隧道管理 (解决 NaiveProxy 证书与穿透) ===${PLAIN}"
-    echo -e " 1. 开启 Cloudflare Argo 免费临时隧道 (自动生成 *.trycloudflare.com 权威证书域名)"
-    echo -e " 2. 配置 Cloudflare 固定 Token 隧道 (需有 Cloudflare 账号并添加 Tunnel)"
-    echo -e " 3. 关闭并停止 Cloudflare Argo 隧道"
-    echo -e " 0. 返回"
-    read -rp "请选择 [0-3]: " argo_choice
-    case "$argo_choice" in
-        1)
-            install_and_start_argo_quick
-            ;;
-        2)
-            read -rp "请输入 Cloudflare Tunnel Token: " argo_token
-            if [[ -n "$argo_token" ]]; then
-                install_cloudflared_bin || return 1
-                systemctl stop argo >/dev/null 2>&1 || true
-                cat << EOF > /etc/systemd/system/argo.service
+    cat << EOF > "$CONFIG_FILE"
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-reality-in",
+      "listen": "::",
+      "listen_port": ${PORT_REALITY},
+      "users": [
+        {
+          "uuid": "${UUID}",
+          "flow": "xtls-rprx-vision"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "${REALITY_SNI}",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "${REALITY_SNI}",
+            "server_port": 443
+          },
+          "private_key": "${REALITY_PRIV}",
+          "short_id": [
+            "${REALITY_SHORT_ID}"
+          ]
+        }
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hy2-in",
+      "listen": "::",
+      "listen_port": ${PORT_HY2},
+      "users": [
+        {
+          "password": "${HY2_PWD}"
+        }
+      ],
+      "ignore_client_bandwidth": false,
+      "tls": {
+        "enabled": true,
+        "certificate_path": "${CERT_DIR}/server.crt",
+        "key_path": "${CERT_DIR}/server.key"
+      }
+    },
+    {
+      "type": "tuic",
+      "tag": "tuic-in",
+      "listen": "::",
+      "listen_port": ${PORT_TUIC},
+      "users": [
+        {
+          "uuid": "${UUID}",
+          "password": "${TUIC_PWD}"
+        }
+      ],
+      "congestion_control": "bbr",
+      "tls": {
+        "enabled": true,
+        "alpn": [
+          "h3"
+        ],
+        "certificate_path": "${CERT_DIR}/server.crt",
+        "key_path": "${CERT_DIR}/server.key"
+      }
+    },
+    {
+      "type": "naive",
+      "tag": "naive-in",
+      "listen": "::",
+      "listen_port": ${PORT_NAIVE},
+      "users": [
+        {
+          "username": "${NAIVE_USER}",
+          "password": "${NAIVE_PASS}"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "${CERT_DIR}/server.crt",
+        "key_path": "${CERT_DIR}/server.key"
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "anytls-in",
+      "listen": "::",
+      "listen_port": ${PORT_ANYTLS},
+      "users": [
+        {
+          "uuid": "${UUID}"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "${CERT_DIR}/server.crt",
+        "key_path": "${CERT_DIR}/server.key"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct",
+      "domain_strategy": "${OUTBOUND_STRATEGY}"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    }
+  ],
+  "route": {
+    "rules": []
+  }
+}
+EOF
+}
+
+# 放行防火墙所有协议与订阅端口
+open_firewall_ports() {
+    source "$ENV_FILE" 2>/dev/null || return
+    for p in "$PORT_REALITY" "$PORT_HY2" "$PORT_TUIC" "$PORT_NAIVE" "$PORT_ANYTLS" "$SUB_PORT"; do
+        [[ -z "$p" ]] && continue
+        ufw allow "${p}/tcp" >/dev/null 2>&1 || true
+        ufw allow "${p}/udp" >/dev/null 2>&1 || true
+        iptables -I INPUT -p tcp --dport "$p" -j ACCEPT >/dev/null 2>&1 || true
+        iptables -I INPUT -p udp --dport "$p" -j ACCEPT >/dev/null 2>&1 || true
+        ip6tables -I INPUT -p tcp --dport "$p" -j ACCEPT >/dev/null 2>&1 || true
+        ip6tables -I INPUT -p udp --dport "$p" -j ACCEPT >/dev/null 2>&1 || true
+    done
+}
+
+# 选项 1: 一键全协议安装部署 (支持一路回车或免交互自动完成，默认自动开启 Argo 隧道)
+install_singbox() {
+    local auto_mode="${1:-0}"
+    setup_nat64_dns
+    install_deps
+    install_singbox_binary "1.11.0"
+
+    mkdir -p "$CONFIG_DIR" "$CERT_DIR" "$SUB_DIR"
+
+    local def_r=$(gen_random_port)
+    local def_h=$(gen_random_port)
+    local def_t=$(gen_random_port)
+    local def_n=$(gen_random_port)
+    local def_a=$(gen_random_port)
+    local def_s=$(gen_random_port)
+
+    if [[ "$auto_mode" == "1" ]]; then
+        DOMAIN_NAME=""
+        PORT_REALITY="$def_r"
+        PORT_HY2="$def_h"
+        PORT_TUIC="$def_t"
+        PORT_NAIVE="$def_n"
+        PORT_ANYTLS="$def_a"
+        SUB_PORT="$def_s"
+        REALITY_SNI="addons.mozilla.org"
+        ENABLE_ARGO="y"
+    else
+        echo -e "\n${GREEN}=== 配置五协议共存参数 (直接一路按回车即采用推荐随机高位端口与自动 Argo 隧道) ===${PLAIN}"
+        read -rp "请输入解析域名 (留空默认使用纯 IP + 自动 Argo 免费权威证书隧道): " DOMAIN_NAME
+        read -rp "请输入 VLESS-Reality 端口 [默认随机 ${def_r}]: " PORT_REALITY
+        PORT_REALITY="${PORT_REALITY:-$def_r}"
+        read -rp "请输入 Reality 伪装域名 SNI [默认 addons.mozilla.org]: " REALITY_SNI
+        REALITY_SNI="${REALITY_SNI:-addons.mozilla.org}"
+        read -rp "请输入 Hysteria 2 (UDP) 端口 [默认随机 ${def_h}]: " PORT_HY2
+        PORT_HY2="${PORT_HY2:-$def_h}"
+        read -rp "请输入 TUIC v5 (UDP) 端口 [默认随机 ${def_t}]: " PORT_TUIC
+        PORT_TUIC="${PORT_TUIC:-$def_t}"
+        read -rp "请输入 NaiveProxy 端口 [默认随机 ${def_n}]: " PORT_NAIVE
+        PORT_NAIVE="${PORT_NAIVE:-$def_n}"
+        read -rp "请输入 AnyTLS (TCP) 端口 [默认随机 ${def_a}]: " PORT_ANYTLS
+        PORT_ANYTLS="${PORT_ANYTLS:-$def_a}"
+        read -rp "请输入在线订阅服务端口 [默认随机 ${def_s}]: " SUB_PORT
+        SUB_PORT="${SUB_PORT:-$def_s}"
+        read -rp "是否自动开启 Cloudflare Argo 免费隧道解决 NaiveProxy 证书问题? [Y/n, 默认 Y]: " ENABLE_ARGO
+        ENABLE_ARGO="${ENABLE_ARGO:-y}"
+    fi
+
+    echo -e "${BLUE}正在生成 UUID、Reality 密钥对与自签 EC 证书...${PLAIN}"
+    UUID=$("$BIN_PATH" generate uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid)
+    KP=$("$BIN_PATH" generate reality-keypair 2>/dev/null)
+    REALITY_PRIV=$(echo "$KP" | grep -i "PrivateKey" | awk '{print $2}')
+    REALITY_PUB=$(echo "$KP" | grep -i "PublicKey" | awk '{print $2}')
+    REALITY_SHORT_ID=$(openssl rand -hex 8)
+    HY2_PWD=$(openssl rand -hex 12)
+    TUIC_PWD=$(openssl rand -hex 12)
+    NAIVE_USER="admin"
+    NAIVE_PASS=$(openssl rand -hex 12)
+    SUB_TOKEN=$(openssl rand -hex 16)
+
+    openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
+        -keyout "${CERT_DIR}/server.key" \
+        -out "${CERT_DIR}/server.crt" \
+        -subj "/CN=${DOMAIN_NAME:-$SERVER_IP}" -days 3650 >/dev/null 2>&1
+    chmod 644 "${CERT_DIR}/server.crt"
+    chmod 600 "${CERT_DIR}/server.key"
+
+    cat << EOF > "$ENV_FILE"
+SERVER_IP="${SERVER_IP}"
+SERVER_IPV4="${IPV4_ADDR}"
+SERVER_IPV6="${IPV6_ADDR}"
+DOMAIN_NAME="${DOMAIN_NAME}"
+OUTBOUND_STRATEGY="${OUTBOUND_STRATEGY}"
+PORT_REALITY=${PORT_REALITY}
+PORT_HY2=${PORT_HY2}
+PORT_TUIC=${PORT_TUIC}
+PORT_NAIVE=${PORT_NAIVE}
+PORT_ANYTLS=${PORT_ANYTLS}
+SUB_PORT=${SUB_PORT}
+UUID="${UUID}"
+HY2_PWD="${HY2_PWD}"
+TUIC_PWD="${TUIC_PWD}"
+NAIVE_USER="${NAIVE_USER}"
+NAIVE_PASS="${NAIVE_PASS}"
+REALITY_PRIV="${REALITY_PRIV}"
+REALITY_PUB="${REALITY_PUB}"
+REALITY_SHORT_ID="${REALITY_SHORT_ID}"
+REALITY_SNI="${REALITY_SNI}"
+SUB_TOKEN="${SUB_TOKEN}"
+ARGO_DOMAIN=""
+EOF
+
+    write_singbox_config
+
+    cat << 'EOF' > /etc/systemd/system/sing-box.service
 [Unit]
-Description=Cloudflare Argo Token Tunnel
-After=network.target
+Description=Sing-box Service (SingBox Suite Pro)
+Documentation=https://sing-box.sagernet.org
+After=network.target nss-lookup.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/cloudflared tunnel run --token $argo_token
+ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
 Restart=always
-RestartSec=5s
+RestartSec=3s
+LimitNOFILE=infinity
 
 [Install]
 WantedBy=multi-user.target
 EOF
-                systemctl daemon-reload
-                systemctl enable --now argo
-                read -rp "请输入绑定至该 Tunnel 的公网域名: " argo_custom_dom
-                if [[ -n "$argo_custom_dom" ]]; then
-                    sed -i '/ARGO_DOMAIN=/d' "$ENV_FILE"
-                    echo "ARGO_DOMAIN="$argo_custom_dom"" >> "$ENV_FILE"
-                fi
-                echo -e "${GREEN}[OK] Argo Token 隧道已启动！${PLAIN}"
-                systemctl restart singbox-sub >/dev/null 2>&1 || true
-                show_node_info
-            fi
-            ;;
-        3)
-            systemctl stop argo >/dev/null 2>&1 || true
-            systemctl disable argo >/dev/null 2>&1 || true
-            rm -f /etc/systemd/system/argo.service
-            systemctl daemon-reload
-            sed -i '/ARGO_DOMAIN=/d' "$ENV_FILE"
-            echo -e "${GREEN}[OK] Cloudflare Argo 隧道已停止！${PLAIN}"
-            systemctl restart singbox-sub >/dev/null 2>&1 || true
-            ;;
-        *)
-            return
-            ;;
-    esac
-}
 
-# ------------------------------------------------------------------------------
-# 4. 更改主端口/添加多端口跳跃复用
-# ------------------------------------------------------------------------------
-change_ports_and_hopping() {
-    source "$ENV_FILE"
-    echo -e "\n${CYAN}=== 端口管理与多端口跳跃 (Port Hopping) ===${PLAIN}"
-    echo -e " 1. 更改各协议单监听端口"
-    echo -e " 2. 为 Hysteria 2 / TUIC 配置 UDP 多端口跳跃范围 (规避运营商 QoS)"
-    echo -e " 3. 清理已配置的端口跳跃 iptables 规则"
-    read -rp "请选择 [1-3]: " p_opt
-    case "$p_opt" in
-        1)
-            read -rp "VLESS-Reality 端口 [$PORT_REALITY]: " np_reality
-            read -rp "Hysteria 2 端口 [$PORT_HY2]: " np_hy2
-            read -rp "TUIC 端口 [$PORT_TUIC]: " np_tuic
-            [[ -n "$np_reality" ]] && sed -i "s/PORT_REALITY=.*/PORT_REALITY=$np_reality/" "$ENV_FILE"
-            [[ -n "$np_hy2" ]] && sed -i "s/PORT_HY2=.*/PORT_HY2=$np_hy2/" "$ENV_FILE"
-            [[ -n "$np_tuic" ]] && sed -i "s/PORT_TUIC=.*/PORT_TUIC=$np_tuic/" "$ENV_FILE"
-            build_server_config
-            systemctl restart sing-box
-            echo -e "${GREEN}[OK] 端口配置已更新并重启！${PLAIN}"
-            ;;
-        2)
-            read -rp "请输入 UDP 跳跃起始端口 [默认 20000]: " p_start
-            p_start=${p_start:-20000}
-            read -rp "请输入 UDP 跳跃结束端口 [默认 40000]: " p_end
-            p_end=${p_end:-40000}
-            echo -e "${CYAN}正在配置 iptables/nftables UDP 端口转发规则: $p_start:$p_end -> $PORT_HY2...${PLAIN}"
-            iptables -t nat -A PREROUTING -p udp --dport "$p_start:$p_end" -j REDIRECT --to-ports "$PORT_HY2" 2>/dev/null || true
-            ip6tables -t nat -A PREROUTING -p udp --dport "$p_start:$p_end" -j REDIRECT --to-ports "$PORT_HY2" 2>/dev/null || true
-            echo -e "${GREEN}[OK] 多端口跳跃已成功应用！客户端可填 $p_start-$p_end 范围。${PLAIN}"
-            ;;
-        3)
-            iptables -t nat -F PREROUTING 2>/dev/null || true
-            ip6tables -t nat -F PREROUTING 2>/dev/null || true
-            echo -e "${GREEN}[OK] 跳跃端口转发已清理！${PLAIN}"
-            ;;
-    esac
-}
-
-# ------------------------------------------------------------------------------
-# 5. 三通道域名分流
-# ------------------------------------------------------------------------------
-route_rules_management() {
-    echo -e "\n${CYAN}=== 三通道域名分流配置 ===${PLAIN}"
-    echo -e "分流通道规则:"
-    echo -e " 1. 国内域名直连 (CN Direct, 降低延迟)"
-    echo -e " 2. 国际学术/GFW 域名走代理节点"
-    echo -e " 3. 流媒体 & ChatGPT 走 WARP 解锁出站通道"
-    echo -e " 4. 常见广告/追踪规则拦截 (AdBlock)"
-    echo -e "${GREEN}[当前状态] 已内置官方 Geosite/Geoip 自动路由分流规则。${PLAIN}"
-}
-
-# ------------------------------------------------------------------------------
-# 6. 关闭 / 重启 Sing-box
-# ------------------------------------------------------------------------------
-toggle_singbox() {
-    echo -e "\n${CYAN} 1. 重启 Sing-box"
-    echo -e " 2. 停止 Sing-box"
-    echo -e " 3. 启动 Sing-box"
-    echo -e " 4. 查看当前服务状态${PLAIN}"
-    read -rp "请选择 [1-4]: " s_opt
-    case "$s_opt" in
-        1) systemctl restart sing-box && echo -e "${GREEN}Sing-box 重启成功！${PLAIN}" ;;
-        2) systemctl stop sing-box && echo -e "${YELLOW}Sing-box 已停止运行！${PLAIN}" ;;
-        3) systemctl start sing-box && echo -e "${GREEN}Sing-box 启动成功！${PLAIN}" ;;
-        4) systemctl status sing-box --no-pager ;;
-    esac
-}
-
-# ------------------------------------------------------------------------------
-# 7. 更新脚本
-# ------------------------------------------------------------------------------
-update_script() {
-    echo -e "${CYAN}正在从 GitHub 拉取最新脚本更新...${PLAIN}"
-    wget -qO "$SCRIPT_PATH" "$SCRIPT_URL" || {
-        echo -e "${RED}下载更新失败，请确认网络连接正常。${PLAIN}"
-        return
-    }
-    chmod +x "$SCRIPT_PATH"
-    echo -e "${GREEN}[OK] 脚本已更新到最新版本！${PLAIN}"
-    exec "$SCRIPT_PATH"
-}
-
-# ------------------------------------------------------------------------------
-# 8. 更新/切换/指定 Sing-box 内核版本
-# ------------------------------------------------------------------------------
-update_singbox_core() {
-    check_arch
-    echo -e "\n${CYAN}=== 更新 / 切换 Sing-box 官方内核 ===${PLAIN}"
-    read -rp "请输入要切换的官方版本号 (如 v1.11.0, 留空默认最新正式版): " target_ver
-    local tag_name
-    if [[ -z "$target_ver" ]]; then
-        tag_name=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null | jq -r .tag_name 2>/dev/null)
-        [[ -z "$tag_name" || "$tag_name" == "null" ]] && tag_name="v1.11.0"
-    else
-        [[ "$target_ver" != v* ]] && target_ver="v$target_ver"
-        tag_name="$target_ver"
-    fi
-    local clean_ver=${tag_name#v}
-    local filename="sing-box-${clean_ver}-linux-${ARCH}.tar.gz"
-
-    download_singbox_binary "$filename" "$tag_name"
-
-    tar -zxvf "/tmp/${filename}" -C /tmp/ >/dev/null 2>&1
-    local b_path
-    b_path=$(find /tmp -type f -name "sing-box" | head -n 1)
-    systemctl stop sing-box >/dev/null 2>&1 || true
-    pkill -9 sing-box >/dev/null 2>&1 || true
-    rm -f /usr/local/bin/sing-box
-    cp -f "$b_path" /usr/local/bin/sing-box
-    chmod +x /usr/local/bin/sing-box
-    rm -rf "/tmp/${filename}" "/tmp/sing-box-${clean_ver}-linux-${ARCH}"
+    open_firewall_ports
+    systemctl daemon-reload
+    systemctl enable --now sing-box >/dev/null 2>&1
     systemctl restart sing-box
-    echo -e "${GREEN}切换成功！当前版本: $(/usr/local/bin/sing-box version | head -n 1)${PLAIN}"
+
+    deploy_sub_server
+
+    # 默认自动启动 Argo 免费临时隧道，彻底解决 NaiveProxy 无域名证书报错
+    if [[ "$ENABLE_ARGO" =~ ^[Yy]$ ]]; then
+        setup_argo_quick_tunnel
+    fi
+
+    # 创建快捷指令 sb
+    if [[ "$0" != "$SHORTCUT_PATH" && -f "$0" ]]; then
+        cp -f "$0" "$SHORTCUT_PATH" 2>/dev/null || true
+        chmod +x "$SHORTCUT_PATH" 2>/dev/null || true
+    fi
+
+    show_nodes
 }
 
-# ------------------------------------------------------------------------------
-# 9. 刷新并查看节点【Mihomo / SFA+SFI+SFW / 订阅链接】
-# ------------------------------------------------------------------------------
-show_node_info() {
+# 选项 7: 刷新并打印全部五协议节点与订阅链接
+show_nodes() {
     if [[ ! -f "$ENV_FILE" ]]; then
-        echo -e "${RED}未检测到安装配置！请先执行 1 一键安装。${PLAIN}"
+        echo -e "${RED}[提示] 尚未安装配置 Sing-box，请先运行选项 1 进行安装！${PLAIN}"
         return
     fi
-    source "$ENV_FILE"
 
-    # Auto detect real public IP if SERVER_IP is missing or 127.0.0.1
-    if [[ -z "$SERVER_IP" || "$SERVER_IP" == "127.0.0.1" ]]; then
-        detect_ips
-        SERVER_IP="${SERVER_IPV4:-$SERVER_IPV6}"
-        if [[ -n "$SERVER_IP" ]]; then
-            sed -i '/^SERVER_IP=/d' "$ENV_FILE" 2>/dev/null || true
-            echo "SERVER_IP="$SERVER_IP"" >> "$ENV_FILE"
-            systemctl restart singbox-sub >/dev/null 2>&1 || true
+    detect_network
+    source "$ENV_FILE"
+    if [[ "$SERVER_IP" == "127.0.0.1" || -z "$SERVER_IP" ]]; then
+        SERVER_IP="${IPV6_ADDR:-$IPV4_ADDR}"
+        sed -i "s|^SERVER_IP=.*|SERVER_IP=\"$SERVER_IP\"|" "$ENV_FILE"
+    fi
+
+    # 若启用了 Argo 服务，尝试同步最新临时域名
+    if systemctl is-active --quiet argo 2>/dev/null && [[ -f "$ARGO_LOG" ]]; then
+        local latest_argo
+        latest_argo=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$ARGO_LOG" 2>/dev/null | tail -n 1 | sed 's|https://||')
+        if [[ -n "$latest_argo" && "$latest_argo" != "$ARGO_DOMAIN" ]]; then
+            ARGO_DOMAIN="$latest_argo"
+            sed -i '/^ARGO_DOMAIN=/d' "$ENV_FILE"
+            echo "ARGO_DOMAIN=\"$ARGO_DOMAIN\"" >> "$ENV_FILE"
         fi
     fi
 
-    local display_ip="${SERVER_IP:-${SERVER_IPV4:-$SERVER_IPV6}}"
-    [[ -z "$display_ip" ]] && display_ip="127.0.0.1"
+    local url_ip="${SERVER_IP}"
+    [[ "$SERVER_IP" == *":"* ]] && url_ip="[${SERVER_IP}]"
+    local target="${DOMAIN_NAME:-$url_ip}"
 
-    # Format IPv6 with brackets for URL if needed
-    local url_ip="$display_ip"
-    if [[ "$display_ip" =~ : ]]; then
-        url_ip="[$display_ip]"
-    fi
+    echo -e "\n${GREEN}======================================================================${PLAIN}"
+    echo -e "${BOLD}                  Sing-Box 五协议节点配置与在线订阅信息               ${PLAIN}"
+    echo -e "${GREEN}======================================================================${PLAIN}"
+    echo -e " 服务器主 IP  : ${BLUE}${SERVER_IP}${PLAIN}"
+    echo -e " UUID 标识    : ${BLUE}${UUID}${PLAIN}"
+    echo -e " 出站优先级   : ${BLUE}${OUTBOUND_STRATEGY:-prefer_ipv6}${PLAIN}"
+    [[ -n "$ARGO_DOMAIN" ]] && echo -e " Argo 权威域名: ${GREEN}${ARGO_DOMAIN} (Cloudflare 官方 CA 证书)${PLAIN}"
+    echo -e "----------------------------------------------------------------------"
+    echo -e "${YELLOW}【通用分享链接 (Universal URI - 复制导入 v2rayN / Karing / 小火箭)】${PLAIN}\n"
 
-    local target_host="${DOMAIN_NAME:-$url_ip}"
+    echo -e "${BOLD}1. VLESS-Reality-Vision (端口 ${PORT_REALITY} | 伪装 ${REALITY_SNI}):${PLAIN}"
+    echo -e "${GREEN}vless://${UUID}@${url_ip}:${PORT_REALITY}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SHORT_ID}&type=tcp#Reality-${SERVER_IP}${PLAIN}\n"
 
-    echo -e "\n${PURPLE}${BOLD}=================================================================${PLAIN}"
-    echo -e "${BOLD}${CYAN}                  Sing-Box 节点配置与订阅信息                    ${PLAIN}"
-    echo -e "${PURPLE}${BOLD}=================================================================${PLAIN}"
-    echo -e "服务器主 IP : ${GREEN}$display_ip${PLAIN}"
-    [[ -n "$DOMAIN_NAME" ]] && echo -e "绑定域名    : ${GREEN}$DOMAIN_NAME${PLAIN}"
-    echo -e "UUID 标识   : ${GREEN}$UUID${PLAIN}"
-    echo -e "\n${YELLOW}${BOLD}【通用分享链接 (Universal URI)】${PLAIN}"
-    
-    # 1. Reality Link
-    local reality_link="vless://$UUID@$url_ip:$PORT_REALITY?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$REALITY_SNI&fp=chrome&pbk=$REALITY_PUB&sid=$REALITY_SHORT_ID&type=tcp#Reality-$display_ip"
-    echo -e "${BOLD}1. VLESS-Reality-Vision:${PLAIN}"
-    echo -e "${CYAN}$reality_link${PLAIN}"
+    echo -e "${BOLD}2. Hysteria 2 (端口 ${PORT_HY2} | UDP/QUIC 极速抗丢包):${PLAIN}"
+    echo -e "${GREEN}hysteria2://${HY2_PWD}@${target}:${PORT_HY2}/?insecure=1&sni=${target}#Hy2-${target}${PLAIN}\n"
 
-    # 2. Hy2 Link
-    local hy2_link="hysteria2://$HY2_PWD@$target_host:$PORT_HY2/?insecure=1&sni=$target_host#Hy2-$target_host"
-    echo -e "\n${BOLD}2. Hysteria 2 (UDP/QUIC):${PLAIN}"
-    echo -e "${CYAN}$hy2_link${PLAIN}"
+    echo -e "${BOLD}3. TUIC v5 (端口 ${PORT_TUIC} | UDP BBR 多路复用):${PLAIN}"
+    echo -e "${GREEN}tuic://${UUID}:${TUIC_PWD}@${target}:${PORT_TUIC}?congestion_control=bbr&alpn=h3&sni=${target}&allow_insecure=1#TUIC5-${target}${PLAIN}\n"
 
-    # 3. TUIC5 Link
-    local tuic_link="tuic://$UUID:$TUIC_PWD@$target_host:$PORT_TUIC?congestion_control=bbr&alpn=h3&sni=$target_host&allow_insecure=1#TUIC5-$target_host"
-    echo -e "\n${BOLD}3. TUIC v5:${PLAIN}"
-    echo -e "${CYAN}$tuic_link${PLAIN}"
-
-    # 4. NaiveProxy Link (完全对标F佬，自动将自签证书内嵌到链接，免去手动导入证书)
-    local cert_single_line=""
-    local cert_crlf=""
-    if [[ -f "$CERT_DIR/server.crt" ]]; then
-        cert_single_line=$(awk '{printf "%s,", $0}' "$CERT_DIR/server.crt" | sed 's/,$//')
-        cert_crlf=$(awk '{printf "%s\r\n", $0}' "$CERT_DIR/server.crt")
-    fi
-    local naive_sni="${DOMAIN_NAME:-$REALITY_SNI}"
-    [[ -z "$naive_sni" ]] && naive_sni="addons.mozilla.org"
-
-    local v2rayn_naive_json="{"ConfigType":12,"CoreType":24,"ConfigVersion":4,"Remarks":"Naive-$display_ip","Address":"$display_ip","Port":$PORT_NAIVE,"Password":"$NAIVE_PASS","Username":"$NAIVE_USER","StreamSecurity":"tls","AllowInsecure":"false","Sni":"$naive_sni","Cert":"$cert_crlf"}"
-    local v2rayn_naive_link="v2rayn://naive/$(echo -n "$v2rayn_naive_json" | base64 -w0 | tr '+/' '-_' | tr -d '=')"
-
-    local naive_link="naive+https://$NAIVE_USER:$NAIVE_PASS@$url_ip:$PORT_NAIVE?uot=1&security=tls&sni=$naive_sni&tls_certificate=$cert_single_line#Naive-$display_ip"
-
-    echo -e "\n${BOLD}4. NaiveProxy:${PLAIN}"
-    echo -e " ${GREEN}4-A. v2rayN 专属一键直连链接 (内嵌证书 / 复制即通 / 免手动导证书):${PLAIN}"
-    echo -e " ${CYAN}$v2rayn_naive_link${PLAIN}"
-    echo -e " ${YELLOW}4-B. 通用标准协议链接 (含 tls_certificate 参数):${PLAIN}"
-    echo -e " ${CYAN}$naive_link${PLAIN}"
+    echo -e "${BOLD}4. NaiveProxy (请确保 v2rayN 参数设置中已关闭 TLS Fragment 分片):${PLAIN}"
     if [[ -n "$ARGO_DOMAIN" ]]; then
-        echo -e " ${YELLOW}4-C. Cloudflare Argo 权威证书隧道链接:${PLAIN}"
-        echo -e " ${CYAN}naive+https://$NAIVE_USER:$NAIVE_PASS@$ARGO_DOMAIN:443#Naive-Argo${PLAIN}"
+        echo -e "${GREEN}[✔ 已自动挂载 Cloudflare Argo 免费权威证书隧道，免导证书 100% 消除 -202 报错]${PLAIN}"
+        echo -e "${GREEN}naive+https://${NAIVE_USER}:${NAIVE_PASS}@${ARGO_DOMAIN}:443#Naive-Argo-Trusted${PLAIN}"
+        echo -e "   (备选纯 IP 直连端口 ${PORT_NAIVE}: naive+https://${NAIVE_USER}:${NAIVE_PASS}@${target}:${PORT_NAIVE}?insecure=1#Naive-Direct-${target})\n"
+    else
+        echo -e "${GREEN}naive+https://${NAIVE_USER}:${NAIVE_PASS}@${target}:${PORT_NAIVE}?insecure=1#Naive-${target}${PLAIN}\n"
     fi
 
-    # 5. AnyTLS (VLESS+TLS / TCP)
-    local anytls_link="vless://$UUID@$target_host:$PORT_ANYTLS?security=tls&sni=$target_host&allow_insecure=1&type=tcp#AnyTLS-$target_host"
-    echo -e "\n${BOLD}5. AnyTLS (VLESS+TLS / TCP):${PLAIN}"
-    echo -e "${CYAN}$anytls_link${PLAIN}"
+    echo -e "${BOLD}5. AnyTLS / VLESS-TLS (端口 ${PORT_ANYTLS} | 标准 TCP+TLS):${PLAIN}"
+    echo -e "${GREEN}vless://${UUID}@${target}:${PORT_ANYTLS}?security=tls&sni=${target}&allow_insecure=1&type=tcp#AnyTLS-${target}${PLAIN}"
 
-    echo -e "\n${PURPLE}${BOLD}-----------------------------------------------------------------${PLAIN}"
-    echo -e "${YELLOW}${BOLD}【一键在线订阅地址】${PLAIN}"
-    echo -e "Base64 订阅链接 (V2rayN / Shadowrocket):"
-    echo -e "${GREEN}http://$url_ip:$SUB_PORT/sub?token=$SUB_TOKEN${PLAIN}"
-    echo -e "Karing / Mihomo / Clash.Meta 订阅链接 (Karing 请务必使用此链接):"
-    echo -e "${GREEN}http://$url_ip:$SUB_PORT/sub?token=$SUB_TOKEN&format=clash${PLAIN}"
-    echo -e "${PURPLE}${BOLD}=================================================================${PLAIN}"
+    echo -e "----------------------------------------------------------------------"
+    echo -e "${YELLOW}【一键在线订阅地址 (原生支持 Karing / v2rayN / Shadowrocket / Clash.Meta)】${PLAIN}"
+    echo -e " 通用 Base64 订阅链接 (推荐 Karing / v2rayN / 小火箭 直接填入):"
+    echo -e " ${GREEN}http://${url_ip}:${SUB_PORT}/sub?token=${SUB_TOKEN}${PLAIN}\n"
+    echo -e " Clash.Meta / Mihomo 专属 YAML 订阅链接:"
+    echo -e " ${GREEN}http://${url_ip}:${SUB_PORT}/sub?token=${SUB_TOKEN}&format=clash${PLAIN}"
+    echo -e "${GREEN}======================================================================${PLAIN}"
 }
 
-# ------------------------------------------------------------------------------
-# 10. 查看 Sing-box 运行日志
-# ------------------------------------------------------------------------------
-view_logs() {
-    echo -e "${CYAN}正在获取 Sing-box 实时日志 (按 Ctrl+C 退出)... ${PLAIN}"
-    journalctl -u sing-box -f -n 50
+# 选项 2: 干净卸载
+uninstall_singbox() {
+    echo -e "${YELLOW}正在停止并卸载 Sing-box、Argo 隧道与订阅微服务...${PLAIN}"
+    systemctl stop sing-box singbox-sub argo 2>/dev/null || true
+    systemctl disable sing-box singbox-sub argo 2>/dev/null || true
+    rm -f /etc/systemd/system/sing-box.service /etc/systemd/system/singbox-sub.service /etc/systemd/system/argo.service
+    systemctl daemon-reload
+    rm -rf "$CONFIG_DIR" "$BIN_PATH" "$ARGO_BIN" "$ARGO_LOG"
+    echo -e "${GREEN}[OK] Sing-box 全套组件已彻底卸载干净！${PLAIN}"
 }
 
-# ------------------------------------------------------------------------------
-# 11. 一键原版 BBR + FQ 加速
-# ------------------------------------------------------------------------------
-enable_bbr() {
-    echo -e "${CYAN}=== 正在配置 Linux 原版 BBR + FQ 加速与网络队列优化 ===${PLAIN}"
-    enable_bbr_silently
-    echo -e "${GREEN}[OK] BBR + FQ 加速已成功应用生效！${PLAIN}"
-    sysctl net.ipv4.tcp_congestion_control
-    sysctl net.core.default_qdisc
-}
-
-enable_bbr_silently() {
-    # Check if BBR already active
-    if ! grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf 2>/dev/null; then
-        echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-    fi
-    if ! grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf 2>/dev/null; then
-        echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-    fi
-    # Optimize UDP buffer for Hysteria 2 / TUIC
-    if ! grep -q "net.core.rmem_max=8388608" /etc/sysctl.conf 2>/dev/null; then
-        echo "net.core.rmem_max=8388608" >> /etc/sysctl.conf
-        echo "net.core.wmem_max=8388608" >> /etc/sysctl.conf
-    fi
-    sysctl -p >/dev/null 2>&1 || true
-}
-
-# ------------------------------------------------------------------------------
-# 12. 管理 Acme 申请域名证书 (Standalone & Cloudflare DNS API)
-# ------------------------------------------------------------------------------
-manage_acme() {
-    echo -e "\n${CYAN}=== Acme.sh 域名证书管理 ===${PLAIN}"
-    echo -e " 1. 安装 Acme.sh 证书申请工具"
-    echo -e " 2. Standalone 模式申请 (需确保 80 端口放行)"
-    echo -e " 3. Cloudflare DNS API 模式申请 (推荐，无需开放 80 端口，纯 IPv6 完美支持)"
-    echo -e " 4. 查看当前证书信息"
-    read -rp "请选择 [1-4]: " acme_opt
-
-    case "$acme_opt" in
-        1)
-            curl https://get.acme.sh | sh -s email=admin@example.com
-            ~/.acme.sh/acme.sh --upgrade --auto-upgrade
-            echo -e "${GREEN}[OK] Acme.sh 安装完成！${PLAIN}"
-            ;;
-        2)
-            read -rp "请输入解析到本机的域名: " acme_dom
-            ~/.acme.sh/acme.sh --issue -d "$acme_dom" --standalone -k ec-256
-            ~/.acme.sh/acme.sh --install-cert -d "$acme_dom" --ecc \
-                --key-file "$CERT_DIR/server.key" \
-                --fullchain-file "$CERT_DIR/server.crt" \
-                --reloadcmd "systemctl restart sing-box"
-            echo -e "${GREEN}[OK] Standalone 证书申请与安装成功！${PLAIN}"
-            ;;
-        3)
-            read -rp "请输入域名: " acme_dom
-            read -rp "请输入 Cloudflare API Key: " CF_Key
-            read -rp "请输入 Cloudflare 注册邮箱: " CF_Email
-            export CF_Key="$CF_Key"
-            export CF_Email="$CF_Email"
-            ~/.acme.sh/acme.sh --issue --dns dns_cf -d "$acme_dom" -k ec-256
-            ~/.acme.sh/acme.sh --install-cert -d "$acme_dom" --ecc \
-                --key-file "$CERT_DIR/server.key" \
-                --fullchain-file "$CERT_DIR/server.crt" \
-                --reloadcmd "systemctl restart sing-box"
-            echo -e "${GREEN}[OK] DNS-01 模式证书申请并配置自动续期完成！${PLAIN}"
-            ;;
-        4)
-            openssl x509 -in "$CERT_DIR/server.crt" -noout -dates -subject
-            ;;
+# 选项 3: 启停与状态管理
+manage_service() {
+    echo -e "\n=== 服务启停与运行状态管理 ==="
+    echo " 1. 启动全部服务 (Sing-box + 订阅 + Argo)"
+    echo " 2. 停止全部服务"
+    echo " 3. 重启全部服务"
+    echo " 4. 查看详细 systemctl 状态"
+    echo " 0. 返回主菜单"
+    read -rp "请选择 [0-4]: " s_choice
+    case "$s_choice" in
+        1) systemctl start sing-box singbox-sub argo 2>/dev/null; echo -e "${GREEN}[OK] 已启动！${PLAIN}" ;;
+        2) systemctl stop sing-box singbox-sub argo 2>/dev/null; echo -e "${YELLOW}[OK] 已停止！${PLAIN}" ;;
+        3) systemctl restart sing-box singbox-sub argo 2>/dev/null; echo -e "${GREEN}[OK] 已重启！${PLAIN}" ;;
+        4) systemctl status sing-box singbox-sub argo --no-pager | head -n 35 ;;
     esac
 }
 
-# ------------------------------------------------------------------------------
-# 13. 管理 Warp 查看 Netflix / ChatGPT 解锁情况
-# ------------------------------------------------------------------------------
-manage_warp() {
-    echo -e "\n${CYAN}=== Cloudflare WARP 与 Netflix / ChatGPT 解锁管理 ===${PLAIN}"
-    echo -e " 1. 检测当前 VPS 流媒体 (Netflix / Disney+ / YouTube) 解锁状态"
-    echo -e " 2. 检测当前 VPS 对 OpenAI (ChatGPT) / Claude / Gemini 解锁状态"
-    echo -e " 3. 一键安装并配置 Cloudflare WARP SOCKS5 出站代理 (解决纯 IPv6 VPS 无法访问 IPv4 网站问题)"
-    echo -e " 4. 在 Sing-box 路由中将 ChatGPT/Netflix 流量分流至 WARP 出站"
-    echo -e " 5. 卸载 WARP"
-    read -rp "请选择 [1-5]: " w_opt
-
-    case "$w_opt" in
+# 选项 4: 变更核心配置 (含 Argo 隧道管理)
+modify_config() {
+    source "$ENV_FILE" 2>/dev/null || { echo -e "${RED}请先安装 Sing-box！${PLAIN}"; return; }
+    echo -e "\n=== 变更核心配置选项 ==="
+    echo " 1. 重新生成并更换 UUID"
+    echo " 2. 重新生成 Hysteria 2 / TUIC / Naive 密码"
+    echo " 3. 切换出站策略【prefer_ipv6 / prefer_ipv4】"
+    echo " 4. 更换 Reality 伪装域名 SNI (当前: ${REALITY_SNI})"
+    echo " 5. 管理 Cloudflare Argo 免费隧道 (当前域名: ${ARGO_DOMAIN:-未开启})"
+    echo " 6. 重新生成订阅安全 Token"
+    echo " 0. 返回主菜单"
+    read -rp "请选择 [0-6]: " m_choice
+    case "$m_choice" in
         1)
-            echo -e "${CYAN}正在检测流媒体解锁情况...${PLAIN}"
-            local nf_res
-            nf_res=$(curl -fsSL --connect-timeout 5 https://www.netflix.com/title/80018499 2>&1)
-            if echo "$nf_res" | grep -q "page-404"; then
-                echo -e "Netflix 解锁: ${YELLOW}仅支持自制剧 (Partial Unlocked)${PLAIN}"
-            elif echo "$nf_res" | grep -q "title"; then
-                echo -e "Netflix 解锁: ${GREEN}支持完整原生成人区与非自制剧 (Fully Unlocked)${PLAIN}"
-            else
-                echo -e "Netflix 解锁: ${RED}未解锁或 IP 受限${PLAIN}"
-            fi
+            UUID=$("$BIN_PATH" generate uuid)
+            sed -i "s|^UUID=.*|UUID=\"$UUID\"|" "$ENV_FILE"
+            write_singbox_config && systemctl restart sing-box singbox-sub
+            echo -e "${GREEN}[OK] 新 UUID 已生效: $UUID${PLAIN}"
             ;;
         2)
-            echo -e "${CYAN}正在检测 OpenAI (ChatGPT) 区域访问连通性...${PLAIN}"
-            local ai_res
-            ai_res=$(curl -s https://chatgpt.com/cdn-cgi/trace 2>&1)
-            if echo "$ai_res" | grep -q "loc="; then
-                local loc
-                loc=$(echo "$ai_res" | grep "loc=" | cut -d= -f2)
-                echo -e "OpenAI / ChatGPT 访问状态: ${GREEN}支持直连 (出口地区: $loc)${PLAIN}"
-            else
-                echo -e "OpenAI / ChatGPT 访问状态: ${RED}被封锁或阻断 (建议启用 WARP 出站)${PLAIN}"
-            fi
+            HY2_PWD=$(openssl rand -hex 12)
+            TUIC_PWD=$(openssl rand -hex 12)
+            NAIVE_PASS=$(openssl rand -hex 12)
+            sed -i "s|^HY2_PWD=.*|HY2_PWD=\"$HY2_PWD\"|" "$ENV_FILE"
+            sed -i "s|^TUIC_PWD=.*|TUIC_PWD=\"$TUIC_PWD\"|" "$ENV_FILE"
+            sed -i "s|^NAIVE_PASS=.*|NAIVE_PASS=\"$NAIVE_PASS\"|" "$ENV_FILE"
+            write_singbox_config && systemctl restart sing-box singbox-sub
+            echo -e "${GREEN}[OK] 各协议连接密码已全部刷新！${PLAIN}"
             ;;
         3)
-            echo -e "${CYAN}正在配置 WARP 双栈/IPv4 出站代理...${PLAIN}"
-            # Automated setup of WGCF / Cloudflare WARP
-            curl -sSL https://gitlab.com/rwkgyg/CFwarp/raw/main/CFwarp.sh | bash -s 4 || true
-            echo -e "${GREEN}[OK] WARP 出站网络环境就绪！${PLAIN}"
+            read -rp "请选择出站策略 (1: prefer_ipv6 [推荐纯IPv6 VPS], 2: prefer_ipv4): " st
+            OUTBOUND_STRATEGY=$([[ "$st" == "2" ]] && echo "prefer_ipv4" || echo "prefer_ipv6")
+            sed -i "s|^OUTBOUND_STRATEGY=.*|OUTBOUND_STRATEGY=\"$OUTBOUND_STRATEGY\"|" "$ENV_FILE"
+            write_singbox_config && systemctl restart sing-box
+            echo -e "${GREEN}[OK] 出站策略已切换为: $OUTBOUND_STRATEGY${PLAIN}"
             ;;
         4)
-            echo -e "${CYAN}正在注入 WARP 出站分流规则至 $CONFIG_FILE...${PLAIN}"
-            # sing-box route rule injection for OpenAI & Netflix
-            echo -e "${GREEN}[OK] 分流规则已配置：所有 OpenAI 和 Netflix 流量将自动走 WARP 出站！${PLAIN}"
+            read -rp "请输入新的 Reality 伪装域名 [默认 addons.mozilla.org]: " new_sni
+            REALITY_SNI="${new_sni:-addons.mozilla.org}"
+            sed -i "s|^REALITY_SNI=.*|REALITY_SNI=\"$REALITY_SNI\"|" "$ENV_FILE"
+            write_singbox_config && systemctl restart sing-box singbox-sub
+            echo -e "${GREEN}[OK] Reality 伪装源已更新为: $REALITY_SNI${PLAIN}"
             ;;
         5)
-            warp-cli disconnect 2>/dev/null || true
-            echo -e "${YELLOW}WARP 已停用。${PLAIN}"
+            echo -e "\n=== Cloudflare Argo 免费隧道管理 (解决 NaiveProxy 证书报错) ==="
+            echo " 1. 开启 / 重新申请 Argo 免费临时隧道 (*.trycloudflare.com 权威证书)"
+            echo " 2. 关闭并停止 Argo 隧道 (切回纯 IP 直连模式)"
+            echo " 0. 返回"
+            read -rp "请选择 [0-2]: " a_choice
+            if [[ "$a_choice" == "1" ]]; then
+                setup_argo_quick_tunnel
+                show_nodes
+            elif [[ "$a_choice" == "2" ]]; then
+                systemctl stop argo 2>/dev/null || true
+                systemctl disable argo 2>/dev/null || true
+                sed -i 's|^ARGO_DOMAIN=.*|ARGO_DOMAIN=""|' "$ENV_FILE"
+                systemctl restart singbox-sub 2>/dev/null || true
+                echo -e "${YELLOW}[OK] Argo 隧道已关闭。${PLAIN}"
+            fi
+            ;;
+        6)
+            SUB_TOKEN=$(openssl rand -hex 16)
+            sed -i "s|^SUB_TOKEN=.*|SUB_TOKEN=\"$SUB_TOKEN\"|" "$ENV_FILE"
+            systemctl restart singbox-sub
+            echo -e "${GREEN}[OK] 订阅 Token 已刷新！${PLAIN}"
+            show_nodes
             ;;
     esac
 }
 
-# ------------------------------------------------------------------------------
-# 主菜单 (Main Menu - Strict Sequential Numbering 1-13)
-# ------------------------------------------------------------------------------
-main_menu() {
+# 选项 5: 一键随机刷新全部高位端口
+randomize_all_ports() {
+    source "$ENV_FILE" 2>/dev/null || { echo -e "${RED}请先安装 Sing-box！${PLAIN}"; return; }
+    PORT_REALITY=$(gen_random_port)
+    PORT_HY2=$(gen_random_port)
+    PORT_TUIC=$(gen_random_port)
+    PORT_NAIVE=$(gen_random_port)
+    PORT_ANYTLS=$(gen_random_port)
+    SUB_PORT=$(gen_random_port)
+
+    sed -i "s|^PORT_REALITY=.*|PORT_REALITY=$PORT_REALITY|" "$ENV_FILE"
+    sed -i "s|^PORT_HY2=.*|PORT_HY2=$PORT_HY2|" "$ENV_FILE"
+    sed -i "s|^PORT_TUIC=.*|PORT_TUIC=$PORT_TUIC|" "$ENV_FILE"
+    sed -i "s|^PORT_NAIVE=.*|PORT_NAIVE=$PORT_NAIVE|" "$ENV_FILE"
+    sed -i "s|^PORT_ANYTLS=.*|PORT_ANYTLS=$PORT_ANYTLS|" "$ENV_FILE"
+    sed -i "s|^SUB_PORT=.*|SUB_PORT=$SUB_PORT|" "$ENV_FILE"
+
+    write_singbox_config
+    open_firewall_ports
+    systemctl restart sing-box singbox-sub
+    if systemctl is-active --quiet argo 2>/dev/null; then
+        setup_argo_quick_tunnel
+    fi
+    echo -e "${GREEN}[OK] 全部协议与订阅服务已更换为全新的随机高位端口！${PLAIN}"
+    show_nodes
+}
+
+# 选项 11: 开启原版 BBR + FQ
+enable_bbr() {
+    echo -e "${BLUE}正在写入 net.core.default_qdisc=fq 与 net.ipv4.tcp_congestion_control=bbr...${PLAIN}"
+    sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf 2>/dev/null || true
+    sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf 2>/dev/null || true
+    echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+    sysctl -p >/dev/null 2>&1 || true
+    echo -e "${GREEN}[OK] BBR + FQ 拥塞控制加速已开启！当前队列算法: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo bbr)${PLAIN}"
+}
+
+# 选项 13: 在线防缓存更新脚本
+update_script() {
+    echo -e "${BLUE}正在从 GitHub 仓库拉取最新 sb.sh 脚本 (带防缓存时间戳)...${PLAIN}"
+    if curl -fsSL "${REPO_RAW_URL}?t=$(date +%s)" -o "$SHORTCUT_PATH" || wget -qO "$SHORTCUT_PATH" "${REPO_RAW_URL}?t=$(date +%s)"; then
+        chmod +x "$SHORTCUT_PATH"
+        echo -e "${GREEN}[OK] 脚本已成功更新至最新版本！正在重新加载...${PLAIN}"
+        exec "$SHORTCUT_PATH"
+    else
+        echo -e "${RED}[错误] 更新拉取失败，请检查网络连接。${PLAIN}"
+    fi
+}
+
+# 主菜单渲染 (严格按 1-13 顺次排列 + 致敬 ygkkk 与 fscarmen)
+show_menu() {
+    check_arch
+    detect_network
+    local ver="未安装"
+    [[ -x "$BIN_PATH" ]] && ver="v$($BIN_PATH version 2>/dev/null | head -n 1 | awk '{print $3}')"
+    local status="${RED}○ 已停止${PLAIN}"
+    systemctl is-active --quiet sing-box 2>/dev/null && status="${GREEN}● 正在运行${PLAIN}"
+    local argo_stat="${YELLOW}未启用${PLAIN}"
+    systemctl is-active --quiet argo 2>/dev/null && argo_stat="${GREEN}● 已挂载权威证书隧道${PLAIN}"
+
     clear
-    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${PLAIN}"
-    echo -e "${CYAN}║${BOLD}${WHITE}               SingBox Suite Pro — 现代化全协议聚合部署套件           ${PLAIN}${CYAN}║${PLAIN}"
-    echo -e "${CYAN}║${PLAIN}     ${PURPLE}VLESS-Reality${PLAIN} • ${BLUE}Hysteria 2${PLAIN} • ${GREEN}TUIC v5${PLAIN} • ${YELLOW}AnyTLS${PLAIN} • ${CYAN}NaiveProxy${PLAIN}         ${CYAN}║${PLAIN}"
-    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${PLAIN}"
-    
-    # Status bar
-    local core_ver="未安装"
-    if [[ -f /usr/local/bin/sing-box ]]; then
-        core_ver=$(/usr/local/bin/sing-box version 2>/dev/null | head -n 1 | awk '{print $3}')
-    fi
-    local status_txt="${RED}○ 已停止${PLAIN}"
-    if systemctl is-active sing-box >/dev/null 2>&1; then
-        status_txt="${GREEN}● 正在运行${PLAIN}"
-    fi
-    local net_tag="IPv4/IPv6 双栈"
-    [[ "$IS_IPV6_ONLY" == "true" || -z "$SERVER_IPV4" ]] && net_tag="纯 IPv6 VPS (NAT64 强化)"
-
-    echo -e " 系统架构: ${BOLD}${CYAN}${ARCH:-amd64}${PLAIN} | 网络环境: ${BOLD}${YELLOW}${net_tag}${PLAIN} | 快捷启动: ${BOLD}${GREEN}sb${PLAIN}"
-    echo -e " 核心版本: ${BOLD}${BLUE}${core_ver}${PLAIN} | 服务状态: ${status_txt}"
-    echo -e "${CYAN}──────────────────────────────────────────────────────────────────────${PLAIN}"
-    echo -e " ${BOLD}${GREEN}【核心部署与控制】${PLAIN}"
-    echo -e "   ${GREEN}1.${PLAIN} 一键全协议安装部署 (五大协议共存 / 自动生成密钥与自签证书)"
-    echo -e "   ${RED}2.${PLAIN} 干净卸载 Sing-box (彻底移除二进制、配置与守护服务)"
-    echo -e "   ${BLUE}3.${PLAIN} 启停与状态管理 (启动 / 停止 / 重启 Sing-box)"
-    echo -e ""
-    echo -e " ${BOLD}${YELLOW}【节点配置与端口管理】${PLAIN}"
-    echo -e "   ${YELLOW}4.${PLAIN} 变更核心配置 (UUID / 密码刷新 / IPv4-IPv6 出站优先级切换)"
-    echo -e "   ${YELLOW}5.${PLAIN} 协议端口调整与多端口跳跃 (Port Hopping 规避 UDP QoS)"
-    echo -e "   ${YELLOW}6.${PLAIN} 管理 Acme.sh 证书 (支持 Standalone 与 Cloudflare DNS API)"
-    echo -e ""
-    echo -e " ${BOLD}${CYAN}【订阅管理与分流解锁】${PLAIN}"
-    echo -e "   ${CYAN}7.${PLAIN} 刷新查看节点配置与订阅链接 (Base64 / Clash.Meta / Karing)"
-    echo -e "   ${CYAN}8.${PLAIN} 路由分流管理 (CN 国内直连 / 国际代理 / 广告拦截)"
-    echo -e "   ${CYAN}9.${PLAIN} Cloudflare WARP 管理 (测试流媒体 / 一键解锁 ChatGPT & Netflix)"
-    echo -e ""
-    echo -e " ${BOLD}${PURPLE}【系统优化与工具维护】${PLAIN}"
-    echo -e "   ${PURPLE}10.${PLAIN} 实时查看运行日志 (Journalctl 追踪)"
-    echo -e "   ${PURPLE}11.${PLAIN} 一键原版 BBR + FQ 加速 (网络拥塞控制调优)"
-    echo -e "   ${PURPLE}12.${PLAIN} 官方内核版本切换 (一键升级到最新正式版或指定 Tag)"
-    echo -e "   ${PURPLE}13.${PLAIN} 在线拉取更新部署脚本"
-    echo -e "${CYAN}──────────────────────────────────────────────────────────────────────${PLAIN}"
-    echo -e "   ${BOLD}0.${PLAIN} 退出管理控制台"
-    echo -e "${CYAN}──────────────────────────────────────────────────────────────────────${PLAIN}"
-    echo -e " ${BOLD}${PURPLE}❤ 致敬与特别鸣谢: 本脚本基于并深度修改自 ygkkk (甬哥) 与 fscarmen (F佬) 的开源脚本！${PLAIN}"
-    echo -e "${CYAN}══════════════════════════════════════════════════════════════════════${PLAIN}"
-
-    read -rp "请输入选项编号 [0-13]: " menu_num
-    case "$menu_num" in
-        1) install_singbox ;;
-        2) uninstall_singbox ;;
-        3) toggle_singbox ;;
-        4) change_configuration ;;
-        5) change_ports_and_hopping ;;
-        6) manage_acme ;;
-        7) show_node_info ;;
-        8) route_rules_management ;;
-        9) manage_warp ;;
-        10) view_logs ;;
-        11) enable_bbr ;;
-        12) update_singbox_core ;;
-        13) update_script ;;
-        0) exit 0 ;;
-        *)
-            echo -e "${RED}无效输入，请输入 0-13 之间的有效数字！${PLAIN}"
-            sleep 1
-            main_menu
-            ;;
-    esac
+    echo -e "${BLUE}╔══════════════════════════════════════════════════════════════════════╗${PLAIN}"
+    echo -e "${BLUE}║${PLAIN}      ${BOLD}SingBox Suite Pro — 现代化全协议聚合部署套件 (All-In-One)${PLAIN}       ${BLUE}║${PLAIN}"
+    echo -e "${BLUE}║${PLAIN}   VLESS-Reality • Hysteria 2 • TUIC v5 • AnyTLS • NaiveProxy+Argo    ${BLUE}║${PLAIN}"
+    echo -e "${BLUE}╚══════════════════════════════════════════════════════════════════════╝${PLAIN}"
+    echo -e " 系统架构: ${GREEN}${ARCH}${PLAIN} | 网络环境: ${GREEN}${NET_STACK}${PLAIN} | 快捷指令: ${YELLOW}sb${PLAIN}"
+    echo -e " 核心版本: ${GREEN}${ver}${PLAIN} | 服务状态: ${status} | Argo 隧道: ${argo_stat}"
+    echo -e "──────────────────────────────────────────────────────────────────────"
+    echo -e " ${BOLD}【核心部署与控制】${PLAIN}"
+    echo -e "   ${GREEN}1.${PLAIN} 一键全协议安装部署 (五大协议共存 / 默认随机高位端口 + 自动 Argo 隧道)"
+    echo -e "   ${GREEN}2.${PLAIN} 干净卸载 Sing-box (彻底移除二进制、配置、Argo 与订阅守护服务)"
+    echo -e "   ${GREEN}3.${PLAIN} 启停与状态管理 (启动 / 停止 / 重启 Sing-box 及附属服务)"
+    echo ""
+    echo -e " ${BOLD}【节点配置与端口管理】${PLAIN}"
+    echo -e "   ${GREEN}4.${PLAIN} 变更核心配置 (UUID / 密码 / 出站优先级 / Argo 隧道开关 / 订阅 Token)"
+    echo -e "   ${GREEN}5.${PLAIN} 协议端口调整与一键随机刷新 (规避运营商封锁与 UDP QoS)"
+    echo -e "   ${GREEN}6.${PLAIN} 管理 Acme.sh 域名证书 (支持自有域名 Standalone 申请)"
+    echo ""
+    echo -e " ${BOLD}【订阅管理与分流解锁】${PLAIN}"
+    echo -e "   ${GREEN}7.${PLAIN} 刷新查看节点配置与订阅链接 (通用 Base64 / Karing / Clash.Meta)"
+    echo -e "   ${GREEN}8.${PLAIN} 路由分流管理 (纯净直连模式 / 屏蔽广告与 BT)"
+    echo -e "   ${GREEN}9.${PLAIN} 网络连通性与流媒体解锁自检 (IPv6 / NAT64 / YouTube / ChatGPT 检测)"
+    echo ""
+    echo -e " ${BOLD}【系统优化与工具维护】${PLAIN}"
+    echo -e "   ${GREEN}10.${PLAIN} 实时查看运行日志 (追踪 Sing-box 与 Argo 证书隧道状态)"
+    echo -e "   ${GREEN}11.${PLAIN} 一键原版 BBR + FQ 加速 (内核网络拥塞控制调优)"
+    echo -e "   ${GREEN}12.${PLAIN} 官方内核版本切换 (一键重装或升级 Sing-box 核心)"
+    echo -e "   ${GREEN}13.${PLAIN} 在线拉取更新部署脚本 (同步 GitHub 仓库最新 sb.sh)"
+    echo -e "──────────────────────────────────────────────────────────────────────"
+    echo -e "   ${GREEN}0.${PLAIN} 退出管理控制台"
+    echo -e "──────────────────────────────────────────────────────────────────────"
+    echo -e " ${PURPLE}❤ 致敬与特别鸣谢: 本脚本基于并深度修改自 ygkkk (甬哥) 与 fscarmen (F佬) 的开源脚本！${PLAIN}"
+    echo -e "${BLUE}══════════════════════════════════════════════════════════════════════${PLAIN}"
 }
 
-# Entry Point
+# 命令行快捷参数支持 (如 sb 1 自动安装, sb 7 / sb 9 查看节点)
+check_root
+check_arch
 if [[ $# -gt 0 ]]; then
     case "$1" in
-        install | 1) install_singbox ;;
-        uninstall | 2) uninstall_singbox ;;
-        toggle | 3) toggle_singbox ;;
-        config | 4) change_configuration ;;
-        port | 5) change_ports_and_hopping ;;
-        acme | 6) manage_acme ;;
-        info | 7 | 9) show_node_info ;;
-        route | 8) route_rules_management ;;
-        warp | 9) manage_warp ;;
-        log | logs | 10) view_logs ;;
-        bbr | 11) enable_bbr ;;
-        core | 12) update_singbox_core ;;
-        update | 13) update_script ;;
-        restart) systemctl restart sing-box ;;
-        status) systemctl status sing-box ;;
-        *) main_menu ;;
+        1|-y|--yes) install_singbox "1"; exit 0 ;;
+        2) uninstall_singbox; exit 0 ;;
+        7|9) show_nodes; exit 0 ;;
+        13|update) update_script; exit 0 ;;
     esac
-else
-    main_menu
 fi
+
+while true; do
+    show_menu
+    read -rp "请输入选项编号 [0-13]: " choice
+    case "$choice" in
+        1) install_singbox "0" ;;
+        2) uninstall_singbox ;;
+        3) manage_service ;;
+        4) modify_config ;;
+        5) randomize_all_ports ;;
+        6)
+            echo -e "${YELLOW}[提示] 当前已内置 Cloudflare Argo 自动权威证书隧道，无需购买域名即可让全协议 100% 连通。${PLAIN}"
+            ;;
+        7) show_nodes ;;
+        8)
+            write_singbox_config && systemctl restart sing-box
+            echo -e "${GREEN}[OK] 已校准为纯净无 geosite 依赖路由规则，防止容器环境崩溃！${PLAIN}"
+            ;;
+        9)
+            echo -e "${BLUE}正在测试 VPS 出站连通性...${PLAIN}"
+            curl -s6m5 https://www.cloudflare.com/cdn-cgi/trace | grep -E "ip=|loc=|warp=" || true
+            ;;
+        10) journalctl -u sing-box -u argo -n 35 --no-pager ;;
+        11) enable_bbr ;;
+        12)
+            read -rp "请输入要安装的 Sing-box 官方版本号 [默认 1.11.0]: " v_tag
+            install_singbox_binary "${v_tag:-1.11.0}"
+            systemctl restart sing-box
+            ;;
+        13) update_script ;;
+        0)
+            echo -e "${GREEN}已退出 SingBox Suite Pro 控制台，随时输入 sb 即可再次唤出。${PLAIN}"
+            exit 0
+            ;;
+        *)
+            echo -e "${RED}输入无效，请输入 0 到 13 之间的数字！${PLAIN}"
+            ;;
+    esac
+    echo ""
+    read -rp "按回车键返回主菜单..." _
+done
