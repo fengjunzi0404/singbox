@@ -77,16 +77,29 @@ check_os() {
 detect_ips() {
     SERVER_IPV4=""
     SERVER_IPV6=""
+    # 1. First probe local interface for global IPv6 (100% reliable on pure IPv6 VPS like Hax)
+    SERVER_IPV6=$(ip -6 addr show scope global 2>/dev/null | grep inet6 | grep -v '::1' | grep -v 'fe80:' | head -n 1 | awk '{print $2}' | cut -d/ -f1 || true)
+    
+    # 2. Check local IPv4 from interface
+    SERVER_IPV4=$(ip -4 addr show scope global 2>/dev/null | grep inet | grep -v '127.0.0.1' | head -n 1 | awk '{print $2}' | cut -d/ -f1 || true)
+
+    # 3. Validate with external API if curl/wget is available
     if command -v curl >/dev/null 2>&1; then
-        SERVER_IPV4=$(curl -4 -s --connect-timeout 2 https://api.ipify.org 2>/dev/null || curl -4 -s --connect-timeout 2 https://ipv4.icanhazip.com 2>/dev/null || true)
-        SERVER_IPV6=$(curl -6 -s --connect-timeout 2 https://api64.ipify.org 2>/dev/null || curl -6 -s --connect-timeout 2 https://ipv6.icanhazip.com 2>/dev/null || true)
+        local ext_v4 ext_v6
+        ext_v4=$(curl -4 -s --connect-timeout 2 https://api.ipify.org 2>/dev/null || curl -4 -s --connect-timeout 2 https://ipv4.icanhazip.com 2>/dev/null || true)
+        [[ -n "$ext_v4" ]] && SERVER_IPV4="$ext_v4"
+        ext_v6=$(curl -6 -s --connect-timeout 2 https://api64.ipify.org 2>/dev/null || curl -s --connect-timeout 2 https://api64.ipify.org 2>/dev/null || true)
+        [[ -n "$ext_v6" ]] && SERVER_IPV6="$ext_v6"
     elif command -v wget >/dev/null 2>&1; then
-        SERVER_IPV4=$(wget -T 2 -t 1 -qO- http://api.ipify.org 2>/dev/null || true)
-        SERVER_IPV6=$(wget -T 2 -t 1 -qO- http://api64.ipify.org 2>/dev/null || true)
+        local ext_w4 ext_w6
+        ext_w4=$(wget -T 2 -t 1 -qO- http://api.ipify.org 2>/dev/null || true)
+        [[ -n "$ext_w4" ]] && SERVER_IPV4="$ext_w4"
+        ext_w6=$(wget -T 2 -t 1 -qO- http://api64.ipify.org 2>/dev/null || true)
+        [[ -n "$ext_w6" ]] && SERVER_IPV6="$ext_w6"
     fi
-    if [[ -z "$SERVER_IPV6" ]]; then
-        SERVER_IPV6=$(ip -6 addr show scope global 2>/dev/null | grep inet6 | head -n 1 | awk '{print $2}' | cut -d/ -f1 || true)
-    fi
+
+    SERVER_IP="${SERVER_IPV4:-$SERVER_IPV6}"
+    [[ -z "$SERVER_IP" ]] && SERVER_IP="127.0.0.1"
 }
 
 check_ip_stack() {
@@ -159,11 +172,12 @@ download_singbox_binary() {
     local filename="$1"
     local tag="$2"
     local primary_url="https://github.com/SagerNet/sing-box/releases/download/${tag}/${filename}"
-    local mirror1="https://ghproxy.net/${primary_url}"
-    local mirror2="https://gh-proxy.com/${primary_url}"
-    local mirror3="https://mirror.ghproxy.com/${primary_url}"
+    local mirror1="https://gh-proxy.com/${primary_url}"
+    local mirror2="https://mirror.ghproxy.com/${primary_url}"
+    local mirror3="https://github.moeyy.xyz/${primary_url}"
+    local mirror4="https://ghproxy.net/${primary_url}"
 
-    local urls=("$mirror1" "$mirror2" "$mirror3" "$primary_url")
+    local urls=("$mirror1" "$mirror2" "$mirror3" "$primary_url" "$mirror4")
     local success=false
 
     echo -e "${CYAN}正在拉取 Sing-box 官方核心文件 (${filename})...${PLAIN}"
@@ -234,7 +248,10 @@ install_singbox() {
         exit 1
     fi
 
-    cp "$extracted_bin" /usr/local/bin/sing-box
+    systemctl stop sing-box >/dev/null 2>&1 || true
+    pkill -9 sing-box >/dev/null 2>&1 || true
+    rm -f /usr/local/bin/sing-box
+    cp -f "$extracted_bin" /usr/local/bin/sing-box
     chmod +x /usr/local/bin/sing-box
     rm -rf "/tmp/${filename}" "/tmp/sing-box-${clean_ver}-linux-${ARCH}"
 
@@ -247,8 +264,9 @@ install_singbox() {
     read -rp "请输入你的解析域名 (如 node.example.com，用于Hy2/TUIC/Naive/AnyTLS，留空则自签/仅IP): " DOMAIN_NAME
     
     # 2. Ports
-    read -rp "请输入 VLESS-Reality 监听端口 [默认 443]: " PORT_REALITY
-    PORT_REALITY=${PORT_REALITY:-443}
+    echo -e "${YELLOW}提示: 国内运营商常封锁 IPv6 443 端口。F佬推荐使用高位非标端口(如 7443)防止被运营商阻断。${PLAIN}"
+    read -rp "请输入 VLESS-Reality 监听端口 [推荐 7443, 留空默认 7443]: " PORT_REALITY
+    PORT_REALITY=${PORT_REALITY:-7443}
 
     read -rp "请输入 Hysteria 2 监听端口 [默认 8443]: " PORT_HY2
     PORT_HY2=${PORT_HY2:-8443}
@@ -274,7 +292,7 @@ install_singbox() {
     local naive_pass
     naive_pass=$(openssl rand -hex 12)
 
-    # 4. Reality Keypair
+    # 4. Reality Keypair & F-style Proven SNI
     local reality_keypair
     reality_keypair=$(/usr/local/bin/sing-box generate reality-keypair)
     local reality_priv
@@ -283,10 +301,16 @@ install_singbox() {
     reality_pub=$(echo "$reality_keypair" | grep -i "PublicKey" | awk '{print $2}')
     local reality_short_id
     reality_short_id=$(openssl rand -hex 8)
-    local reality_sni="www.apple.com"
+    
+    # F佬核心经验：addons.mozilla.org 具备原生双栈 IPv6+IPv4、干净 TLS 1.3，无国内 CDN 劫持
+    read -rp "请输入 Reality 伪装域名 SNI [推荐/默认 addons.mozilla.org]: " reality_sni_in
+    local reality_sni="${reality_sni_in:-addons.mozilla.org}"
 
     # Save to singbox.env
     cat << EOF > "$ENV_FILE"
+SERVER_IP="$SERVER_IP"
+SERVER_IPV4="$SERVER_IPV4"
+SERVER_IPV6="$SERVER_IPV6"
 DOMAIN_NAME="$DOMAIN_NAME"
 PORT_REALITY=$PORT_REALITY
 PORT_HY2=$PORT_HY2
@@ -310,6 +334,24 @@ EOF
 
     # Build Master config.json
     build_server_config
+
+    # Unblock ports in firewall
+    if command -v ufw >/dev/null 2>&1; then
+        ufw allow $PORT_REALITY/tcp >/dev/null 2>&1 || true
+        ufw allow $PORT_HY2/udp >/dev/null 2>&1 || true
+        ufw allow $PORT_TUIC/udp >/dev/null 2>&1 || true
+        ufw allow $PORT_NAIVE/tcp >/dev/null 2>&1 || true
+        ufw allow $PORT_ANYTLS/tcp >/dev/null 2>&1 || true
+        ufw allow $SUB_PORT/tcp >/dev/null 2>&1 || true
+    fi
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -I INPUT -p tcp --dport $PORT_REALITY -j ACCEPT 2>/dev/null || true
+        ip6tables -I INPUT -p udp --dport $PORT_HY2 -j ACCEPT 2>/dev/null || true
+        ip6tables -I INPUT -p udp --dport $PORT_TUIC -j ACCEPT 2>/dev/null || true
+        ip6tables -I INPUT -p tcp --dport $PORT_NAIVE -j ACCEPT 2>/dev/null || true
+        ip6tables -I INPUT -p tcp --dport $PORT_ANYTLS -j ACCEPT 2>/dev/null || true
+        ip6tables -I INPUT -p tcp --dport $SUB_PORT -j ACCEPT 2>/dev/null || true
+    fi
 
     # Create systemd service
     setup_systemd_service
@@ -354,6 +396,12 @@ build_server_config() {
 
     # Listen address binding: [::] for dual-stack/IPv6 or 0.0.0.0
     local listen_addr="::"
+
+    # Outbound DNS strategy: Pure IPv6 VPS must prefer IPv6 to avoid connection timeouts
+    local domain_strat="prefer_ipv6"
+    if [[ "$IS_IPV6_ONLY" != "true" && -n "$SERVER_IPV4" ]]; then
+        domain_strat="prefer_ipv4"
+    fi
 
     cat << EOF > "$CONFIG_FILE"
 {
@@ -466,7 +514,7 @@ build_server_config() {
     {
       "type": "direct",
       "tag": "direct",
-      "domain_strategy": "prefer_ipv4"
+      "domain_strategy": "$domain_strat"
     },
     {
       "type": "block",
@@ -474,13 +522,7 @@ build_server_config() {
     }
   ],
   "route": {
-    "rules": [
-      {
-        "geosite": "category-ads-all",
-        "outbound": "block"
-      }
-    ],
-    "auto_detect_interface": true
+    "rules": []
   }
 }
 EOF
@@ -497,8 +539,6 @@ Documentation=https://sing-box.sagernet.org
 After=network.target nss-lookup.target
 
 [Service]
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
 ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
 Restart=on-failure
 RestartSec=5s
@@ -559,16 +599,20 @@ class SubHandler(http.server.SimpleHTTPRequestHandler):
 
         ip = env.get("SERVER_IP", "127.0.0.1")
         uuid = env.get("UUID", "")
-        domain = env.get("DOMAIN_NAME", ip)
+        url_ip = f"[{ip}]" if ":" in ip else ip
+        domain = env.get("DOMAIN_NAME", "")
+        target_host = domain if domain else url_ip
 
         # Generate Share Links
         links = []
         # 1. Reality
-        links.append(f"vless://{uuid}@{ip}:{env.get('PORT_REALITY', 443)}?encryption=none&flow=xtls-rprx-vision&security=reality&sni={env.get('REALITY_SNI', 'www.apple.com')}&fp=chrome&pbk={env.get('REALITY_PUB','')}&sid={env.get('REALITY_SHORT_ID','')}&type=tcp#Reality-{ip}")
+        links.append(f"vless://{uuid}@{url_ip}:{env.get('PORT_REALITY', 443)}?encryption=none&flow=xtls-rprx-vision&security=reality&sni={env.get('REALITY_SNI', 'www.apple.com')}&fp=chrome&pbk={env.get('REALITY_PUB','')}&sid={env.get('REALITY_SHORT_ID','')}&type=tcp#Reality-{ip}")
         # 2. Hy2
-        links.append(f"hysteria2://{env.get('HY2_PWD','')}@{domain}:{env.get('PORT_HY2', 8443)}/?insecure=1&sni={domain}#Hy2-{domain}")
+        links.append(f"hysteria2://{env.get('HY2_PWD','')}@{target_host}:{env.get('PORT_HY2', 8443)}/?insecure=1&sni={target_host}#Hy2-{target_host}")
         # 3. TUIC
-        links.append(f"tuic://{uuid}:{env.get('TUIC_PWD','')}@{domain}:{env.get('PORT_TUIC', 9443)}?congestion_control=bbr&alpn=h3&sni={domain}&allow_insecure=1#TUIC5-{domain}")
+        links.append(f"tuic://{uuid}:{env.get('TUIC_PWD','')}@{target_host}:{env.get('PORT_TUIC', 9443)}?congestion_control=bbr&alpn=h3&sni={target_host}&allow_insecure=1#TUIC5-{target_host}")
+        # 4. AnyTLS
+        links.append(f"vless://{uuid}@{target_host}:{env.get('PORT_ANYTLS', 11443)}?security=tls&sni={target_host}&allow_insecure=1&type=tcp#AnyTLS-{target_host}")
 
         fmt = qs.get("format", ["base64"])[0]
 
@@ -595,10 +639,19 @@ proxies:
     client-fingerprint: chrome
   - name: "Hy2-Node"
     type: hysteria2
-    server: {domain}
+    server: {domain if domain else ip}
     port: {env.get('PORT_HY2', 8443)}
     password: {env.get('HY2_PWD', '')}
-    sni: {domain}
+    sni: {domain if domain else ip}
+    skip-cert-verify: true
+  - name: "AnyTLS-Node"
+    type: vless
+    server: {domain if domain else ip}
+    port: {env.get('PORT_ANYTLS', 11443)}
+    uuid: {uuid}
+    network: tcp
+    tls: true
+    servername: {domain if domain else ip}
     skip-cert-verify: true
 """
             self.wfile.write(yaml_out.encode('utf-8'))
@@ -826,7 +879,10 @@ update_singbox_core() {
     tar -zxvf "/tmp/${filename}" -C /tmp/ >/dev/null 2>&1
     local b_path
     b_path=$(find /tmp -type f -name "sing-box" | head -n 1)
-    cp "$b_path" /usr/local/bin/sing-box
+    systemctl stop sing-box >/dev/null 2>&1 || true
+    pkill -9 sing-box >/dev/null 2>&1 || true
+    rm -f /usr/local/bin/sing-box
+    cp -f "$b_path" /usr/local/bin/sing-box
     chmod +x /usr/local/bin/sing-box
     rm -rf "/tmp/${filename}" "/tmp/sing-box-${clean_ver}-linux-${ARCH}"
     systemctl restart sing-box
@@ -843,7 +899,18 @@ show_node_info() {
     fi
     source "$ENV_FILE"
 
-    local display_ip="${SERVER_IPV4:-$SERVER_IPV6}"
+    # Auto detect real public IP if SERVER_IP is missing or 127.0.0.1
+    if [[ -z "$SERVER_IP" || "$SERVER_IP" == "127.0.0.1" ]]; then
+        detect_ips
+        SERVER_IP="${SERVER_IPV4:-$SERVER_IPV6}"
+        if [[ -n "$SERVER_IP" ]]; then
+            sed -i '/^SERVER_IP=/d' "$ENV_FILE" 2>/dev/null || true
+            echo "SERVER_IP="$SERVER_IP"" >> "$ENV_FILE"
+            systemctl restart singbox-sub >/dev/null 2>&1 || true
+        fi
+    fi
+
+    local display_ip="${SERVER_IP:-${SERVER_IPV4:-$SERVER_IPV6}}"
     [[ -z "$display_ip" ]] && display_ip="127.0.0.1"
 
     # Format IPv6 with brackets for URL if needed
@@ -880,7 +947,15 @@ show_node_info() {
     # 4. NaiveProxy Link
     local naive_link="naive+https://$NAIVE_USER:$NAIVE_PASS@$target_host:$PORT_NAIVE#Naive-$target_host"
     echo -e "\n${BOLD}4. NaiveProxy:${PLAIN}"
+    if [[ -z "$DOMAIN_NAME" ]]; then
+        echo -e "${YELLOW}[F佬提示] NaiveProxy 采用 Chrome 网络栈，强制校验有效域名证书。当前仅 IP 模式下客户端会拒绝自签证书。建议在菜单 3 启用 Cloudflare Argo 隧道或在菜单 12 配置域名证书。${PLAIN}"
+    fi
     echo -e "${CYAN}$naive_link${PLAIN}"
+
+    # 5. AnyTLS (VLESS+TLS / TCP)
+    local anytls_link="vless://$UUID@$target_host:$PORT_ANYTLS?security=tls&sni=$target_host&allow_insecure=1&type=tcp#AnyTLS-$target_host"
+    echo -e "\n${BOLD}5. AnyTLS (VLESS+TLS / TCP):${PLAIN}"
+    echo -e "${CYAN}$anytls_link${PLAIN}"
 
     echo -e "\n${PURPLE}${BOLD}-----------------------------------------------------------------${PLAIN}"
     echo -e "${YELLOW}${BOLD}【一键在线订阅地址】${PLAIN}"
