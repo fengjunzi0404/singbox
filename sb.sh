@@ -615,17 +615,34 @@ def load_env():
                     env[k] = v.strip('"')
     return env
 
-class SubHandler(http.server.SimpleHTTPRequestHandler):
+class SubHandler(http.server.BaseHTTPRequestHandler):
+    def send_data(self, code, content_type, data):
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Connection", "close")
+        self.send_header("profile-update-interval", "24")
+        self.end_headers()
+        self.wfile.write(data)
+        self.wfile.flush()
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
     def do_GET(self):
         env = load_env()
         parsed = urllib.parse.urlparse(self.path)
         qs = urllib.parse.parse_qs(parsed.query)
-        token = qs.get("token", [""])[0]
+        token = qs.get("token", [""])[0].strip()
+        expected_token = env.get("SUB_TOKEN", "").strip()
 
-        if token != env.get("SUB_TOKEN", ""):
-            self.send_response(403)
-            self.end_headers()
-            self.wfile.write(b"Forbidden: Invalid Subscription Token")
+        if expected_token and token != expected_token:
+            err = b"403 Forbidden: Invalid or missing subscription token
+"
+            self.send_data(403, "text/plain; charset=utf-8", err)
             return
 
         ip = env.get("SERVER_IP", "127.0.0.1")
@@ -643,17 +660,18 @@ class SubHandler(http.server.SimpleHTTPRequestHandler):
         # 3. TUIC
         links.append(f"tuic://{uuid}:{env.get('TUIC_PWD','')}@{target_host}:{env.get('PORT_TUIC', 9443)}?congestion_control=bbr&alpn=h3&sni={target_host}&allow_insecure=1#TUIC5-{target_host}")
         # 4. NaiveProxy
-        links.append(f"naive+https://{env.get('NAIVE_USER','admin')}:{env.get('NAIVE_PASS','')}@{target_host}:{env.get('PORT_NAIVE', 10443)}?insecure=1#Naive-{target_host}")
+        argo = env.get("ARGO_DOMAIN", "").strip()
+        naive_target = argo if argo else target_host
+        naive_p = 443 if argo else env.get('PORT_NAIVE', 10443)
+        naive_tag = "Naive-Argo" if argo else f"Naive-{target_host}"
+        links.append(f"naive+https://{env.get('NAIVE_USER','admin')}:{env.get('NAIVE_PASS','')}@{naive_target}:{naive_p}#{naive_tag}")
         # 5. AnyTLS
         links.append(f"vless://{uuid}@{target_host}:{env.get('PORT_ANYTLS', 11443)}?security=tls&sni={target_host}&allow_insecure=1&type=tcp#AnyTLS-{target_host}")
 
-        fmt = qs.get("format", ["base64"])[0]
+        fmt = qs.get("format", [""])[0].lower()
+        ua = self.headers.get("User-Agent", "").lower()
 
-        if fmt in ["clash", "karing", "meta"]:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/yaml; charset=utf-8")
-            self.send_header("profile-update-interval", "24")
-            self.end_headers()
+        if fmt in ["clash", "karing", "meta"] or any(k in ua for k in ["clash", "karing", "meta", "stash"]):
             yaml_out = f"""port: 7890
 socks-port: 7891
 allow-lan: false
@@ -712,13 +730,11 @@ rules:
   - GEOIP,CN,DIRECT
   - MATCH,PROXY
 """
-            self.wfile.write(yaml_out.encode('utf-8'))
+            self.send_data(200, "text/yaml; charset=utf-8", yaml_out.encode('utf-8'))
         else:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.end_headers()
             raw_text = "\n".join(links)
-            self.wfile.write(base64.b64encode(raw_text.encode('utf-8')))
+            b64_data = base64.b64encode(raw_text.encode('utf-8'))
+            self.send_data(200, "text/plain; charset=utf-8", b64_data)
 
 class DualStackServer(socketserver.ThreadingTCPServer):
     address_family = socket.AF_INET6
@@ -829,6 +845,158 @@ change_configuration() {
                     -d "chat_id=${tg_chat}" -d "text=Sing-box 节点通知测试成功！" >/dev/null 2>&1
                 echo -e "${GREEN}[OK] TG 通知已绑定并发送测试消息！${PLAIN}"
             fi
+            ;;
+        5)
+            manage_argo
+            ;;
+        6)
+            local new_sub_token=$(openssl rand -hex 16)
+            sed -i "s/SUB_TOKEN=\".*\"/SUB_TOKEN=\"$new_sub_token\"/" "$ENV_FILE"
+            systemctl restart singbox-sub >/dev/null 2>&1 || true
+            echo -e "${GREEN}[OK] 订阅 Token 已更新为: $new_sub_token${PLAIN}"
+            ;;
+        *)
+            return
+            ;;
+    esac
+}
+
+# ------------------------------------------------------------------------------
+# Cloudflare Argo Tunnel Management
+# ------------------------------------------------------------------------------
+install_cloudflared_bin() {
+    if [[ ! -f /usr/local/bin/cloudflared ]]; then
+        echo -e "${CYAN}正在下载 Cloudflare 官方 cloudflared 二进制程序...${PLAIN}"
+        local c_arch="amd64"
+        [[ "$ARCH" == "arm64" ]] && c_arch="arm64"
+        local urls=(
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${c_arch}"
+            "https://ghproxy.net/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${c_arch}"
+            "https://mirror.ghproxy.com/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${c_arch}"
+        )
+        local dl_ok=0
+        for u in "${urls[@]}"; do
+            if curl -fsSL --connect-timeout 8 "$u" -o /usr/local/bin/cloudflared 2>/dev/null; then
+                chmod +x /usr/local/bin/cloudflared
+                dl_ok=1
+                break
+            fi
+        done
+        if [[ $dl_ok -eq 0 ]]; then
+            echo -e "${RED}下载 cloudflared 失败，请检查网络或稍后重试！${PLAIN}"
+            return 1
+        fi
+    fi
+}
+
+install_and_start_argo_quick() {
+    source "$ENV_FILE"
+    install_cloudflared_bin || return 1
+
+    local p_naive="${PORT_NAIVE:-10443}"
+    echo -e "${CYAN}正在启动 Cloudflare Argo 免费临时隧道 (映射 NaiveProxy 端口 $p_naive)...${PLAIN}"
+    systemctl stop argo >/dev/null 2>&1 || true
+    rm -f /var/log/argo.log
+
+    cat << EOF > /etc/systemd/system/argo.service
+[Unit]
+Description=Cloudflare Argo Quick Tunnel
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cloudflared tunnel --url https://127.0.0.1:$p_naive --no-tls-verify --no-autoupdate
+StandardOutput=append:/var/log/argo.log
+StandardError=append:/var/log/argo.log
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now argo
+
+    echo -e "${YELLOW}正在向 Cloudflare 全球边缘注册隧道并申请权威域名 (约需 5 秒)...${PLAIN}"
+    local argo_dom=""
+    for i in {1..12}; do
+        sleep 1
+        if [[ -f /var/log/argo.log ]]; then
+            argo_dom=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /var/log/argo.log | tail -n 1 | sed 's|https://||')
+            if [[ -n "$argo_dom" ]]; then
+                break
+            fi
+        fi
+    done
+
+    if [[ -n "$argo_dom" ]]; then
+        sed -i '/ARGO_DOMAIN=/d' "$ENV_FILE"
+        echo "ARGO_DOMAIN="$argo_dom"" >> "$ENV_FILE"
+        echo -e "${GREEN}=================================================================${PLAIN}"
+        echo -e "${GREEN}🎉 Cloudflare Argo 免费临时隧道成功建立！${PLAIN}"
+        echo -e "权威证书官方域名: ${CYAN}${BOLD}$argo_dom${PLAIN}"
+        echo -e "官方合法 TLS 证书: ${GREEN}由 Cloudflare 权威 CA 颁发 (Chrome 100% 信任)${PLAIN}"
+        echo -e "全球双栈加速接入: ${GREEN}支持 IPv4 和 IPv6 客户端免配置直接连通${PLAIN}"
+        echo -e "${GREEN}=================================================================${PLAIN}"
+        systemctl restart singbox-sub >/dev/null 2>&1 || true
+        show_node_info
+    else
+        echo -e "${RED}未能及时获取 trycloudflare 域名，请查看日志: cat /var/log/argo.log${PLAIN}"
+    fi
+}
+
+manage_argo() {
+    source "$ENV_FILE"
+    echo -e "\n${CYAN}=== Cloudflare Argo 免费隧道管理 (解决 NaiveProxy 证书与穿透) ===${PLAIN}"
+    echo -e " 1. 开启 Cloudflare Argo 免费临时隧道 (自动生成 *.trycloudflare.com 权威证书域名)"
+    echo -e " 2. 配置 Cloudflare 固定 Token 隧道 (需有 Cloudflare 账号并添加 Tunnel)"
+    echo -e " 3. 关闭并停止 Cloudflare Argo 隧道"
+    echo -e " 0. 返回"
+    read -rp "请选择 [0-3]: " argo_choice
+    case "$argo_choice" in
+        1)
+            install_and_start_argo_quick
+            ;;
+        2)
+            read -rp "请输入 Cloudflare Tunnel Token: " argo_token
+            if [[ -n "$argo_token" ]]; then
+                install_cloudflared_bin || return 1
+                systemctl stop argo >/dev/null 2>&1 || true
+                cat << EOF > /etc/systemd/system/argo.service
+[Unit]
+Description=Cloudflare Argo Token Tunnel
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cloudflared tunnel run --token $argo_token
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+                systemctl daemon-reload
+                systemctl enable --now argo
+                read -rp "请输入绑定至该 Tunnel 的公网域名: " argo_custom_dom
+                if [[ -n "$argo_custom_dom" ]]; then
+                    sed -i '/ARGO_DOMAIN=/d' "$ENV_FILE"
+                    echo "ARGO_DOMAIN="$argo_custom_dom"" >> "$ENV_FILE"
+                fi
+                echo -e "${GREEN}[OK] Argo Token 隧道已启动！${PLAIN}"
+                systemctl restart singbox-sub >/dev/null 2>&1 || true
+                show_node_info
+            fi
+            ;;
+        3)
+            systemctl stop argo >/dev/null 2>&1 || true
+            systemctl disable argo >/dev/null 2>&1 || true
+            rm -f /etc/systemd/system/argo.service
+            systemctl daemon-reload
+            sed -i '/ARGO_DOMAIN=/d' "$ENV_FILE"
+            echo -e "${GREEN}[OK] Cloudflare Argo 隧道已停止！${PLAIN}"
+            systemctl restart singbox-sub >/dev/null 2>&1 || true
             ;;
         *)
             return
@@ -1009,10 +1177,20 @@ show_node_info() {
     echo -e "${CYAN}$tuic_link${PLAIN}"
 
     # 4. NaiveProxy Link
-    local naive_link="naive+https://$NAIVE_USER:$NAIVE_PASS@$target_host:$PORT_NAIVE#Naive-$target_host"
+    local naive_host="$target_host"
+    local naive_port="$PORT_NAIVE"
+    local naive_tag="Naive-$target_host"
+    if [[ -n "$ARGO_DOMAIN" ]]; then
+        naive_host="$ARGO_DOMAIN"
+        naive_port=443
+        naive_tag="Naive-Argo"
+    fi
+    local naive_link="naive+https://$NAIVE_USER:$NAIVE_PASS@$naive_host:$naive_port#$naive_tag"
     echo -e "\n${BOLD}4. NaiveProxy:${PLAIN}"
-    if [[ -z "$DOMAIN_NAME" ]]; then
-        echo -e "${YELLOW}[F佬提示] NaiveProxy 采用 Chrome 网络栈，强制校验有效域名证书。当前仅 IP 模式下客户端会拒绝自签证书。建议在菜单 3 启用 Cloudflare Argo 隧道或在菜单 12 配置域名证书。${PLAIN}"
+    if [[ -n "$ARGO_DOMAIN" ]]; then
+        echo -e "${GREEN}[OK] 已挂载 Cloudflare Argo 官方权威证书隧道 ($ARGO_DOMAIN:443)，Chrome/v2rayN 100% 信任，无 -202 证书报错！${PLAIN}"
+    elif [[ -z "$DOMAIN_NAME" ]]; then
+        echo -e "${YELLOW}[提示] 当前使用自签证书，Chrome 会报 -202 证书无效。可在菜单 4 -> 5 开启 Cloudflare Argo 免费临时隧道一键解决！${PLAIN}"
     fi
     echo -e "${CYAN}$naive_link${PLAIN}"
 
