@@ -66,6 +66,7 @@
 ```bash
 # 推荐：wget 方式 (适用于 Hax 等未预装 curl 的纯 IPv6 系统)
 wget -qO /usr/local/bin/sb https://raw.githubusercontent.com/fengjunzi0404/singbox/main/sb.sh && chmod +x /usr/local/bin/sb && /usr/local/bin/sb
+```
 
 ```bash
 # 或使用 curl 方式：
