@@ -30,14 +30,6 @@
 
 ---
 
-## 💖 致敬与特别鸣谢 (Credits & Acknowledgments)
-
-本项目基于并深度修改/参考了以下两位开源大佬的卓越脚本与架构设计：
-- **[ygkkk (甬哥坎坎坷坷)](https://github.com/yonggekkk)**: 提供了经典的 Sing-box 基础功能架构与命令行运维灵感。
-- **[fscarmen (F佬)](https://github.com/fscarmen/sing-box)**: 提供了强大的多协议共存体系、IPv6 纯栈优化经验与 Reality 伪装优化思路。
-
-本项目在前辈探索的基础上，针对纯 IPv6 VPS (如 Hax) 进行了 NAT64/DNS64 自动打通、双栈微服务订阅（解决 IPv6 拒绝连接）、AnyTLS 拓展、非标端口规避 443 封锁等专属优化。谨向两位前辈致以最崇高的敬意与感谢！
-
 ---
 
 ## ⚡ 纯 IPv6 VPS 能搭建吗？
@@ -88,6 +80,10 @@ sb
 | **Shadowrocket (小火箭)** | iOS / iPadOS | 全部协议 | 扫描终端二维码或剪贴板导入 |
 | **V2rayN** | Windows | VLESS-Reality, Hy2, TUIC | 批量粘贴通用链接 |
 | **NekoBox** | Android / Windows | 全部协议 | 批量链接导入 |
-> 💖 **致敬与特别鸣谢**: 本项目基于并深度修改/参考了 **[ygkkk (甬哥坎坎坷坷)](https://github.com/yonggekkk)** 与 **[fscarmen (F佬)](https://github.com/fscarmen/sing-box)** 两位前辈的优秀开源脚本与架构灵感，谨致崇高敬意！
+## 💖 致敬与特别鸣谢 (Credits & Acknowledgments)
 
+本项目基于并深度修改/参考了以下两位开源大佬的卓越脚本与架构设计：
+- **[ygkkk (甬哥坎坎坷坷)](https://github.com/yonggekkk)**: 提供了经典的 Sing-box 基础功能架构与命令行运维灵感。
+- **[fscarmen (F佬)](https://github.com/fscarmen/sing-box)**: 提供了强大的多协议共存体系、IPv6 纯栈优化经验与 Reality 伪装优化思路。
+本项目在前辈探索的基础上，针对纯 IPv6 VPS (如 Hax) 进行了 NAT64/DNS64 自动打通、双栈微服务订阅（解决 IPv6 拒绝连接）、AnyTLS 拓展、非标端口规避 443 封锁等专属优化。谨向两位前辈致以最崇高的敬意与感谢！
 ---
