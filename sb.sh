@@ -398,14 +398,28 @@ EOF
 # Certificate Generation
 # ------------------------------------------------------------------------------
 generate_self_signed_cert() {
-    local domain=${1:-"singbox.node"}
+    local domain="${1:-addons.mozilla.org}"
+    [[ -z "$domain" ]] && domain="addons.mozilla.org"
     mkdir -p "$CERT_DIR"
     if [[ ! -f "$CERT_DIR/server.crt" || ! -f "$CERT_DIR/server.key" ]]; then
-        echo -e "${CYAN}正在生成 TLS 证书...${PLAIN}"
-        openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
-            -keyout "$CERT_DIR/server.key" \
-            -out "$CERT_DIR/server.crt" \
-            -subj "/CN=$domain" -days 3650 >/dev/null 2>&1
+        echo -e "${CYAN}正在生成具备 SAN 扩展的 TLS 证书 (SNI: $domain)...${PLAIN}"
+        cat > "$CERT_DIR/cert.conf" << EOF
+[req]
+distinguished_name = req_distinguished_name
+x509_extensions = v3_req
+prompt = no
+[req_distinguished_name]
+CN = $domain
+[v3_req]
+subjectAltName = @alt_names
+[alt_names]
+DNS.1 = $domain
+IP.1 = $SERVER_IP
+EOF
+        openssl ecparam -genkey -name prime256v1 -out "$CERT_DIR/server.key" >/dev/null 2>&1
+        openssl req -new -x509 -days 3650 -key "$CERT_DIR/server.key" \
+            -out "$CERT_DIR/server.crt" -config "$CERT_DIR/cert.conf" -extensions v3_req >/dev/null 2>&1
+        rm -f "$CERT_DIR/cert.conf"
         chmod 644 "$CERT_DIR/server.crt"
         chmod 600 "$CERT_DIR/server.key"
     fi
@@ -633,46 +647,72 @@ class SubHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        env = load_env()
-        parsed = urllib.parse.urlparse(self.path)
-        qs = urllib.parse.parse_qs(parsed.query)
-        token = qs.get("token", [""])[0].strip()
-        expected_token = env.get("SUB_TOKEN", "").strip()
+        try:
+            env = load_env()
+            parsed = urllib.parse.urlparse(self.path)
+            qs = urllib.parse.parse_qs(parsed.query)
+            token = qs.get("token", [""])[0].strip()
+            expected_token = env.get("SUB_TOKEN", "").strip()
 
-        if expected_token and token != expected_token:
-            err = b"403 Forbidden: Invalid or missing subscription token
+            if expected_token and token != expected_token:
+                err = b"403 Forbidden: Invalid or missing subscription token
 "
-            self.send_data(403, "text/plain; charset=utf-8", err)
-            return
+                self.send_data(403, "text/plain; charset=utf-8", err)
+                return
 
-        ip = env.get("SERVER_IP", "127.0.0.1")
-        uuid = env.get("UUID", "")
-        url_ip = f"[{ip}]" if ":" in ip else ip
-        domain = env.get("DOMAIN_NAME", "")
-        target_host = domain if domain else url_ip
+            ip = env.get("SERVER_IP", "127.0.0.1")
+            uuid = env.get("UUID", "")
+            url_ip = f"[{ip}]" if ":" in ip else ip
+            domain = env.get("DOMAIN_NAME", "")
+            target_host = domain if domain else url_ip
 
-        # Generate Share Links
-        links = []
-        # 1. Reality
-        links.append(f"vless://{uuid}@{url_ip}:{env.get('PORT_REALITY', 7443)}?encryption=none&flow=xtls-rprx-vision&security=reality&sni={env.get('REALITY_SNI', 'addons.mozilla.org')}&fp=chrome&pbk={env.get('REALITY_PUB','')}&sid={env.get('REALITY_SHORT_ID','')}&type=tcp#Reality-{ip}")
-        # 2. Hy2
-        links.append(f"hysteria2://{env.get('HY2_PWD','')}@{target_host}:{env.get('PORT_HY2', 8443)}/?insecure=1&sni={target_host}#Hy2-{target_host}")
-        # 3. TUIC
-        links.append(f"tuic://{uuid}:{env.get('TUIC_PWD','')}@{target_host}:{env.get('PORT_TUIC', 9443)}?congestion_control=bbr&alpn=h3&sni={target_host}&allow_insecure=1#TUIC5-{target_host}")
-        # 4. NaiveProxy
-        argo = env.get("ARGO_DOMAIN", "").strip()
-        naive_target = argo if argo else target_host
-        naive_p = 443 if argo else env.get('PORT_NAIVE', 10443)
-        naive_tag = "Naive-Argo" if argo else f"Naive-{target_host}"
-        links.append(f"naive+https://{env.get('NAIVE_USER','admin')}:{env.get('NAIVE_PASS','')}@{naive_target}:{naive_p}#{naive_tag}")
-        # 5. AnyTLS
-        links.append(f"vless://{uuid}@{target_host}:{env.get('PORT_ANYTLS', 11443)}?security=tls&sni={target_host}&allow_insecure=1&type=tcp#AnyTLS-{target_host}")
+            # Generate Share Links
+            links = []
+            # 1. Reality
+            links.append(f"vless://{uuid}@{url_ip}:{env.get('PORT_REALITY', 7443)}?encryption=none&flow=xtls-rprx-vision&security=reality&sni={env.get('REALITY_SNI', 'addons.mozilla.org')}&fp=chrome&pbk={env.get('REALITY_PUB','')}&sid={env.get('REALITY_SHORT_ID','')}&type=tcp#Reality-{ip}")
+            # 2. Hy2
+            links.append(f"hysteria2://{env.get('HY2_PWD','')}@{target_host}:{env.get('PORT_HY2', 8443)}/?insecure=1&sni={target_host}#Hy2-{target_host}")
+            # 3. TUIC
+            links.append(f"tuic://{uuid}:{env.get('TUIC_PWD','')}@{target_host}:{env.get('PORT_TUIC', 9443)}?congestion_control=bbr&alpn=h3&sni={target_host}&allow_insecure=1#TUIC5-{target_host}")
+            # 4. NaiveProxy (内嵌自签证书，与 F 佬完全一致，免手动导证书)
+            cert_crlf = ""
+            cert_line = ""
+            cert_file = "/etc/sing-box/cert/server.crt"
+            if os.path.exists(cert_file):
+                try:
+                    with open(cert_file, "r") as cf:
+                        raw_c = cf.read()
+                        cert_crlf = raw_c.replace("
+", "
+")
+                        cert_line = ",".join([l.strip() for l in raw_c.splitlines() if l.strip()])
+                except Exception:
+                    pass
+            naive_sni = env.get("DOMAIN_NAME", env.get("REALITY_SNI", "addons.mozilla.org"))
+            if not naive_sni:
+                naive_sni = "addons.mozilla.org"
 
-        fmt = qs.get("format", [""])[0].lower()
-        ua = self.headers.get("User-Agent", "").lower()
+            argo = env.get("ARGO_DOMAIN", "").strip()
+            if argo:
+                links.append(f"naive+https://{env.get('NAIVE_USER','admin')}:{env.get('NAIVE_PASS','')}@{argo}:443#Naive-Argo")
+            else:
+                links.append(f"naive+https://{env.get('NAIVE_USER','admin')}:{env.get('NAIVE_PASS','')}@{url_ip}:{env.get('PORT_NAIVE', 10443)}?uot=1&security=tls&sni={naive_sni}&tls_certificate={cert_line}#Naive-{ip}")
+                if cert_crlf:
+                    v2_cfg = {
+                        "ConfigType": 12, "CoreType": 24, "ConfigVersion": 4,
+                        "Remarks": f"Naive-{ip}", "Address": ip, "Port": int(env.get("PORT_NAIVE", 10443)),
+                        "Password": env.get("NAIVE_PASS", ""), "Username": env.get("NAIVE_USER", "admin"),
+                        "StreamSecurity": "tls", "AllowInsecure": "false", "Sni": naive_sni, "Cert": cert_crlf
+                    }
+                    v2_b64 = base64.urlsafe_b64encode(json.dumps(v2_cfg).encode("utf-8")).decode("utf-8").rstrip("=")
+                    links.append(f"v2rayn://naive/{v2_b64}")
+            # 5. AnyTLS
+            links.append(f"vless://{uuid}@{target_host}:{env.get('PORT_ANYTLS', 11443)}?security=tls&sni={target_host}&allow_insecure=1&type=tcp#AnyTLS-{target_host}")
 
-        if fmt in ["clash", "karing", "meta"] or any(k in ua for k in ["clash", "karing", "meta", "stash"]):
-            yaml_out = f"""port: 7890
+            fmt = qs.get("format", ["base64"])[0].lower()
+
+            if fmt in ["clash", "meta"]:
+                yaml_out = f"""port: 7890
 socks-port: 7891
 allow-lan: false
 mode: rule
@@ -730,11 +770,15 @@ rules:
   - GEOIP,CN,DIRECT
   - MATCH,PROXY
 """
-            self.send_data(200, "text/yaml; charset=utf-8", yaml_out.encode('utf-8'))
-        else:
-            raw_text = "\n".join(links)
-            b64_data = base64.b64encode(raw_text.encode('utf-8'))
-            self.send_data(200, "text/plain; charset=utf-8", b64_data)
+                self.send_data(200, "text/yaml; charset=utf-8", yaml_out.encode('utf-8'))
+            else:
+                # Default Base64 (Universally supported by Karing, v2rayN, Shadowrocket, NekoBox)
+                raw_text = "\n".join(links)
+                b64_data = base64.b64encode(raw_text.encode('utf-8'))
+                self.send_data(200, "text/plain; charset=utf-8", b64_data)
+        except Exception as e:
+            err_body = f"500 Internal Error: {str(e)}\n".encode('utf-8')
+            self.send_data(500, "text/plain; charset=utf-8", err_body)
 
 class DualStackServer(socketserver.ThreadingTCPServer):
     address_family = socket.AF_INET6
@@ -905,7 +949,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/cloudflared tunnel --url https://127.0.0.1:$p_naive --no-tls-verify --no-autoupdate
+ExecStart=/usr/local/bin/cloudflared tunnel --url https://localhost:$p_naive --no-tls-verify --no-autoupdate
 StandardOutput=append:/var/log/argo.log
 StandardError=append:/var/log/argo.log
 Restart=always
@@ -1176,23 +1220,30 @@ show_node_info() {
     echo -e "\n${BOLD}3. TUIC v5:${PLAIN}"
     echo -e "${CYAN}$tuic_link${PLAIN}"
 
-    # 4. NaiveProxy Link
-    local naive_host="$target_host"
-    local naive_port="$PORT_NAIVE"
-    local naive_tag="Naive-$target_host"
-    if [[ -n "$ARGO_DOMAIN" ]]; then
-        naive_host="$ARGO_DOMAIN"
-        naive_port=443
-        naive_tag="Naive-Argo"
+    # 4. NaiveProxy Link (完全对标F佬，自动将自签证书内嵌到链接，免去手动导入证书)
+    local cert_single_line=""
+    local cert_crlf=""
+    if [[ -f "$CERT_DIR/server.crt" ]]; then
+        cert_single_line=$(awk '{printf "%s,", $0}' "$CERT_DIR/server.crt" | sed 's/,$//')
+        cert_crlf=$(awk '{printf "%s\r\n", $0}' "$CERT_DIR/server.crt")
     fi
-    local naive_link="naive+https://$NAIVE_USER:$NAIVE_PASS@$naive_host:$naive_port#$naive_tag"
+    local naive_sni="${DOMAIN_NAME:-$REALITY_SNI}"
+    [[ -z "$naive_sni" ]] && naive_sni="addons.mozilla.org"
+
+    local v2rayn_naive_json="{"ConfigType":12,"CoreType":24,"ConfigVersion":4,"Remarks":"Naive-$display_ip","Address":"$display_ip","Port":$PORT_NAIVE,"Password":"$NAIVE_PASS","Username":"$NAIVE_USER","StreamSecurity":"tls","AllowInsecure":"false","Sni":"$naive_sni","Cert":"$cert_crlf"}"
+    local v2rayn_naive_link="v2rayn://naive/$(echo -n "$v2rayn_naive_json" | base64 -w0 | tr '+/' '-_' | tr -d '=')"
+
+    local naive_link="naive+https://$NAIVE_USER:$NAIVE_PASS@$url_ip:$PORT_NAIVE?uot=1&security=tls&sni=$naive_sni&tls_certificate=$cert_single_line#Naive-$display_ip"
+
     echo -e "\n${BOLD}4. NaiveProxy:${PLAIN}"
+    echo -e " ${GREEN}4-A. v2rayN 专属一键直连链接 (内嵌证书 / 复制即通 / 免手动导证书):${PLAIN}"
+    echo -e " ${CYAN}$v2rayn_naive_link${PLAIN}"
+    echo -e " ${YELLOW}4-B. 通用标准协议链接 (含 tls_certificate 参数):${PLAIN}"
+    echo -e " ${CYAN}$naive_link${PLAIN}"
     if [[ -n "$ARGO_DOMAIN" ]]; then
-        echo -e "${GREEN}[OK] 已挂载 Cloudflare Argo 官方权威证书隧道 ($ARGO_DOMAIN:443)，Chrome/v2rayN 100% 信任，无 -202 证书报错！${PLAIN}"
-    elif [[ -z "$DOMAIN_NAME" ]]; then
-        echo -e "${YELLOW}[提示] 当前使用自签证书，Chrome 会报 -202 证书无效。可在菜单 4 -> 5 开启 Cloudflare Argo 免费临时隧道一键解决！${PLAIN}"
+        echo -e " ${YELLOW}4-C. Cloudflare Argo 权威证书隧道链接:${PLAIN}"
+        echo -e " ${CYAN}naive+https://$NAIVE_USER:$NAIVE_PASS@$ARGO_DOMAIN:443#Naive-Argo${PLAIN}"
     fi
-    echo -e "${CYAN}$naive_link${PLAIN}"
 
     # 5. AnyTLS (VLESS+TLS / TCP)
     local anytls_link="vless://$UUID@$target_host:$PORT_ANYTLS?security=tls&sni=$target_host&allow_insecure=1&type=tcp#AnyTLS-$target_host"
@@ -1203,7 +1254,7 @@ show_node_info() {
     echo -e "${YELLOW}${BOLD}【一键在线订阅地址】${PLAIN}"
     echo -e "Base64 订阅链接 (V2rayN / Shadowrocket):"
     echo -e "${GREEN}http://$url_ip:$SUB_PORT/sub?token=$SUB_TOKEN${PLAIN}"
-    echo -e "Mihomo / Clash.Meta 订阅链接:"
+    echo -e "Karing / Mihomo / Clash.Meta 订阅链接 (Karing 请务必使用此链接):"
     echo -e "${GREEN}http://$url_ip:$SUB_PORT/sub?token=$SUB_TOKEN&format=clash${PLAIN}"
     echo -e "${PURPLE}${BOLD}=================================================================${PLAIN}"
 }
