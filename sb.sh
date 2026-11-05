@@ -606,12 +606,14 @@ class SubHandler(http.server.SimpleHTTPRequestHandler):
         # Generate Share Links
         links = []
         # 1. Reality
-        links.append(f"vless://{uuid}@{url_ip}:{env.get('PORT_REALITY', 443)}?encryption=none&flow=xtls-rprx-vision&security=reality&sni={env.get('REALITY_SNI', 'www.apple.com')}&fp=chrome&pbk={env.get('REALITY_PUB','')}&sid={env.get('REALITY_SHORT_ID','')}&type=tcp#Reality-{ip}")
+        links.append(f"vless://{uuid}@{url_ip}:{env.get('PORT_REALITY', 7443)}?encryption=none&flow=xtls-rprx-vision&security=reality&sni={env.get('REALITY_SNI', 'addons.mozilla.org')}&fp=chrome&pbk={env.get('REALITY_PUB','')}&sid={env.get('REALITY_SHORT_ID','')}&type=tcp#Reality-{ip}")
         # 2. Hy2
         links.append(f"hysteria2://{env.get('HY2_PWD','')}@{target_host}:{env.get('PORT_HY2', 8443)}/?insecure=1&sni={target_host}#Hy2-{target_host}")
         # 3. TUIC
         links.append(f"tuic://{uuid}:{env.get('TUIC_PWD','')}@{target_host}:{env.get('PORT_TUIC', 9443)}?congestion_control=bbr&alpn=h3&sni={target_host}&allow_insecure=1#TUIC5-{target_host}")
-        # 4. AnyTLS
+        # 4. NaiveProxy
+        links.append(f"naive+https://{env.get('NAIVE_USER','admin')}:{env.get('NAIVE_PASS','')}@{target_host}:{env.get('PORT_NAIVE', 10443)}?insecure=1#Naive-{target_host}")
+        # 5. AnyTLS
         links.append(f"vless://{uuid}@{target_host}:{env.get('PORT_ANYTLS', 11443)}?security=tls&sni={target_host}&allow_insecure=1&type=tcp#AnyTLS-{target_host}")
 
         fmt = qs.get("format", ["base64"])[0]
@@ -627,12 +629,12 @@ proxies:
   - name: "Reality-Node"
     type: vless
     server: {ip}
-    port: {env.get('PORT_REALITY', 443)}
+    port: {env.get('PORT_REALITY', 7443)}
     uuid: {uuid}
     network: tcp
     tls: true
     flow: xtls-rprx-vision
-    servername: {env.get('REALITY_SNI', 'www.apple.com')}
+    servername: {env.get('REALITY_SNI', 'addons.mozilla.org')}
     reality-opts:
       public-key: {env.get('REALITY_PUB', '')}
       short-id: {env.get('REALITY_SHORT_ID', '')}
@@ -642,6 +644,16 @@ proxies:
     server: {domain if domain else ip}
     port: {env.get('PORT_HY2', 8443)}
     password: {env.get('HY2_PWD', '')}
+    sni: {domain if domain else ip}
+    skip-cert-verify: true
+  - name: "TUIC-Node"
+    type: tuic
+    server: {domain if domain else ip}
+    port: {env.get('PORT_TUIC', 9443)}
+    uuid: {uuid}
+    password: {env.get('TUIC_PWD', '')}
+    congestion-controller: bbr
+    alpn: [h3]
     sni: {domain if domain else ip}
     skip-cert-verify: true
   - name: "AnyTLS-Node"
@@ -662,13 +674,17 @@ proxies:
             raw_text = "\n".join(links)
             self.wfile.write(base64.b64encode(raw_text.encode('utf-8')))
 
-Handler = SubHandler
-socketserver.TCPServer.allow_reuse_address = True
-try:
-    with socketserver.TCPServer(("", PORT), Handler) as httpd:
-        httpd.serve_forever()
-except Exception:
-    pass
+class DualStackServer(socketserver.ThreadingTCPServer):
+    address_family = socket.AF_INET6
+    allow_reuse_address = True
+
+if __name__ == '__main__':
+    try:
+        with DualStackServer(("::", PORT), SubHandler) as httpd:
+            httpd.serve_forever()
+    except Exception:
+        with socketserver.TCPServer(("", PORT), SubHandler) as httpd:
+            httpd.serve_forever()
 PYEOF
 
     cat << 'EOF' > /etc/systemd/system/singbox-sub.service
@@ -1102,40 +1118,55 @@ manage_warp() {
 }
 
 # ------------------------------------------------------------------------------
-# 主菜单 (Main Menu - Matching Yongge / Singbox Script 1-13 Options)
+# 主菜单 (Main Menu - Modern Cloud-Native Dashboard Style)
 # ------------------------------------------------------------------------------
 main_menu() {
     clear
-    echo -e "${PURPLE}~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~${PLAIN}"
-    echo -e "${CYAN}Sing-box 全协议自动化部署套件 (VLESS-Reality / Hy2 / TUIC5 / AnyTLS / Naive)${PLAIN}"
-    echo -e "支持: Ubuntu / Debian / CentOS / Alpine / 纯 IPv6 VPS 自动化兼容"
-    echo -e "快捷指令: ${GREEN}sb${PLAIN}"
-    echo -e "${PURPLE}~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~${PLAIN}"
-    echo -e " ${GREEN}1. 一键安装 Sing-box (五协议共存)${PLAIN}"
-    echo -e " ${RED}2. 删除卸载 Sing-box${PLAIN}"
-    echo -e "${PURPLE}------------------------------------------------------------------${PLAIN}"
-    echo -e " 3. 变更配置【双证书TLS/UUID路径/Argo/IP优先/TG通知/Warp/订阅/CDN优选】"
-    echo -e " 4. 更改主端口/添加多端口跳跃复用"
-    echo -e " 5. 三通道域名分流 (CN Direct / Proxy / WARP 解锁)"
-    echo -e " 6. 关闭/重启 Sing-box"
-    echo -e " 7. 更新 Sing-box 部署脚本"
-    echo -e " 8. 更新/切换/指定 Sing-box 官方内核版本"
-    echo -e "${PURPLE}------------------------------------------------------------------${PLAIN}"
-    echo -e " ${CYAN}9. 刷新并查看节点【Mihomo/SFA+SFI+SFW/订阅链接/推送TG通知】${PLAIN}"
-    echo -e " 10. 查看 Sing-box 运行日志"
-    echo -e " 11. 一键原版 BBR+FQ 加速"
-    echo -e " 12. 管理 Acme 申请域名证书"
-    echo -e " 13. 管理 Warp 查看 Netflix/ChatGPT 解锁情况"
-    echo -e "${PURPLE}------------------------------------------------------------------${PLAIN}"
-    echo -e " 0. 退出脚本"
-    echo -e "${PURPLE}~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~${PLAIN}"
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${PLAIN}"
+    echo -e "${CYAN}║${BOLD}${WHITE}               SingBox Suite Pro — 现代化全协议聚合部署套件           ${PLAIN}${CYAN}║${PLAIN}"
+    echo -e "${CYAN}║${PLAIN}     ${PURPLE}VLESS-Reality${PLAIN} • ${BLUE}Hysteria 2${PLAIN} • ${GREEN}TUIC v5${PLAIN} • ${YELLOW}AnyTLS${PLAIN} • ${CYAN}NaiveProxy${PLAIN}         ${CYAN}║${PLAIN}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${PLAIN}"
     
-    # Show active core status
-    if systemctl is-active sing-box >/dev/null 2>&1; then
-        echo -e "Sing-box 运行状态: ${GREEN}● 正在运行${PLAIN} | 内核: $(/usr/local/bin/sing-box version 2>/dev/null | head -n 1 | awk '{print $3}')"
-    else
-        echo -e "Sing-box 运行状态: ${RED}○ 未运行${PLAIN}"
+    # Status bar
+    local core_ver="未安装"
+    if [[ -f /usr/local/bin/sing-box ]]; then
+        core_ver=$(/usr/local/bin/sing-box version 2>/dev/null | head -n 1 | awk '{print $3}')
     fi
+    local status_txt="${RED}○ 已停止${PLAIN}"
+    if systemctl is-active sing-box >/dev/null 2>&1; then
+        status_txt="${GREEN}● 正在运行${PLAIN}"
+    fi
+    local net_tag="IPv4/IPv6 双栈"
+    [[ "$IS_IPV6_ONLY" == "true" || -z "$SERVER_IPV4" ]] && net_tag="纯 IPv6 VPS (NAT64 强化)"
+
+    echo -e " 系统架构: ${BOLD}${CYAN}${ARCH:-amd64}${PLAIN} | 网络环境: ${BOLD}${YELLOW}${net_tag}${PLAIN} | 快捷启动: ${BOLD}${GREEN}sb${PLAIN}"
+    echo -e " 核心版本: ${BOLD}${BLUE}${core_ver}${PLAIN} | 服务状态: ${status_txt}"
+    echo -e "${CYAN}──────────────────────────────────────────────────────────────────────${PLAIN}"
+    echo -e " ${BOLD}${GREEN}【核心部署与控制】${PLAIN}"
+    echo -e "   ${GREEN}1.${PLAIN} 一键全协议安装部署 (五大协议共存 / 自动生成密钥与自签证书)"
+    echo -e "   ${RED}2.${PLAIN} 干净卸载 Sing-box (彻底移除二进制、配置与守护服务)"
+    echo -e "   ${BLUE}6.${PLAIN} 快速控制服务 (启动 / 停止 / 重启 Sing-box)"
+    echo -e ""
+    echo -e " ${BOLD}${YELLOW}【端口管理与节点配置】${PLAIN}"
+    echo -e "   ${YELLOW}3.${PLAIN} 变更核心配置 (UUID / 密码刷新 / IPv4-IPv6 出站优先级切换)"
+    echo -e "   ${YELLOW}4.${PLAIN} 协议端口调整与多端口跳跃 (Port Hopping 规避 UDP QoS)"
+    echo -e "   ${YELLOW}12.${PLAIN} 管理 Acme.sh 证书 (支持 Standalone 与 Cloudflare DNS API)"
+    echo -e ""
+    echo -e " ${BOLD}${CYAN}【订阅管理与分流解锁】${PLAIN}"
+    echo -e "   ${CYAN}9.${PLAIN} 刷新查看节点配置与订阅链接 (Base64 / Clash.Meta / Karing)"
+    echo -e "   ${CYAN}5.${PLAIN} 路由分流管理 (CN 国内直连 / 国际代理 / 广告拦截)"
+    echo -e "   ${CYAN}13.${PLAIN} Cloudflare WARP 管理 (测试流媒体 / 一键解锁 ChatGPT & Netflix)"
+    echo -e ""
+    echo -e " ${BOLD}${PURPLE}【系统优化与工具维护】${PLAIN}"
+    echo -e "   ${PURPLE}8.${PLAIN} 官方内核版本切换 (一键升级到最新正式版或指定 Tag)"
+    echo -e "   ${PURPLE}10.${PLAIN} 实时查看运行日志 (Journalctl 追踪)"
+    echo -e "   ${PURPLE}11.${PLAIN} 一键原版 BBR + FQ 加速 (网络拥塞控制调优)"
+    echo -e "   ${PURPLE}7.${PLAIN} 在线拉取更新部署脚本"
+    echo -e "${CYAN}──────────────────────────────────────────────────────────────────────${PLAIN}"
+    echo -e "   ${BOLD}0.${PLAIN} 退出管理控制台"
+    echo -e "${CYAN}──────────────────────────────────────────────────────────────────────${PLAIN}"
+    echo -e " ${BOLD}${PURPLE}❤ 致敬与鸣谢: 特别感谢 ygkkk (甬哥) 与 fscarmen (F佬) 两位巨佬的开源贡献与灵感支持！${PLAIN}"
+    echo -e "${CYAN}══════════════════════════════════════════════════════════════════════${PLAIN}"
 
     read -rp "请输入选项编号 [0-13]: " menu_num
     case "$menu_num" in
