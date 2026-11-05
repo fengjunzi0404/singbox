@@ -1,9 +1,7 @@
 # SingBox Suite Pro — 现代化五协议聚合一键部署套件
 
-> 💖 **致敬与特别鸣谢 (Credits & Acknowledgments)**  
-> 本项目基于并深度修改、参考了 **[ygkkk (甬哥坎坎坷坷)](https://github.com/ygkkk)** 与 **[fscarmen (F佬)](https://github.com/fscarmen/sing-box)** 两位开源前辈的优秀脚本设计与工程实践，特此致以诚挚感谢与崇高敬意！
 
----
+
 
 ## ✨ 核心特性 (专为纯 IPv6 / Hax 与双栈 VPS 深度强化)
 
