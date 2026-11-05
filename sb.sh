@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Sing-Box All-In-One Automated Deployment Script (Multi-Protocol Suite)
-# Protocols: VLESS-Reality-Vision | Hysteria 2 | TUIC v5 | AnyTLS | NaiveProxy
-# Full support for IPv4 & Pure IPv6 VPS (Auto NAT64 / WARP Dual-Stack Outbound)
-# Shortcuts: sb
+# SingBox Suite Pro — 现代化全协议聚合部署运维套件
+# 协议支持: VLESS-Reality-Vision | Hysteria 2 | TUIC v5 | AnyTLS | NaiveProxy
+# 原生深度优化: 纯 IPv6 VPS (如 Hax / 自动 DNS64/NAT64 加速) & 双栈 VPS
+# 致敬与特别鸣谢: 本脚本基于并深度修改自 ygkkk (甬哥) 与 fscarmen (F佬) 的开源项目
+# 快捷指令: sb
 # ==============================================================================
 
 export LANG=en_US.UTF-8
@@ -1118,7 +1119,7 @@ manage_warp() {
 }
 
 # ------------------------------------------------------------------------------
-# 主菜单 (Main Menu - Modern Cloud-Native Dashboard Style)
+# 主菜单 (Main Menu - Strict Sequential Numbering 1-13)
 # ------------------------------------------------------------------------------
 main_menu() {
     clear
@@ -1145,44 +1146,44 @@ main_menu() {
     echo -e " ${BOLD}${GREEN}【核心部署与控制】${PLAIN}"
     echo -e "   ${GREEN}1.${PLAIN} 一键全协议安装部署 (五大协议共存 / 自动生成密钥与自签证书)"
     echo -e "   ${RED}2.${PLAIN} 干净卸载 Sing-box (彻底移除二进制、配置与守护服务)"
-    echo -e "   ${BLUE}6.${PLAIN} 快速控制服务 (启动 / 停止 / 重启 Sing-box)"
+    echo -e "   ${BLUE}3.${PLAIN} 启停与状态管理 (启动 / 停止 / 重启 Sing-box)"
     echo -e ""
-    echo -e " ${BOLD}${YELLOW}【端口管理与节点配置】${PLAIN}"
-    echo -e "   ${YELLOW}3.${PLAIN} 变更核心配置 (UUID / 密码刷新 / IPv4-IPv6 出站优先级切换)"
-    echo -e "   ${YELLOW}4.${PLAIN} 协议端口调整与多端口跳跃 (Port Hopping 规避 UDP QoS)"
-    echo -e "   ${YELLOW}12.${PLAIN} 管理 Acme.sh 证书 (支持 Standalone 与 Cloudflare DNS API)"
+    echo -e " ${BOLD}${YELLOW}【节点配置与端口管理】${PLAIN}"
+    echo -e "   ${YELLOW}4.${PLAIN} 变更核心配置 (UUID / 密码刷新 / IPv4-IPv6 出站优先级切换)"
+    echo -e "   ${YELLOW}5.${PLAIN} 协议端口调整与多端口跳跃 (Port Hopping 规避 UDP QoS)"
+    echo -e "   ${YELLOW}6.${PLAIN} 管理 Acme.sh 证书 (支持 Standalone 与 Cloudflare DNS API)"
     echo -e ""
     echo -e " ${BOLD}${CYAN}【订阅管理与分流解锁】${PLAIN}"
-    echo -e "   ${CYAN}9.${PLAIN} 刷新查看节点配置与订阅链接 (Base64 / Clash.Meta / Karing)"
-    echo -e "   ${CYAN}5.${PLAIN} 路由分流管理 (CN 国内直连 / 国际代理 / 广告拦截)"
-    echo -e "   ${CYAN}13.${PLAIN} Cloudflare WARP 管理 (测试流媒体 / 一键解锁 ChatGPT & Netflix)"
+    echo -e "   ${CYAN}7.${PLAIN} 刷新查看节点配置与订阅链接 (Base64 / Clash.Meta / Karing)"
+    echo -e "   ${CYAN}8.${PLAIN} 路由分流管理 (CN 国内直连 / 国际代理 / 广告拦截)"
+    echo -e "   ${CYAN}9.${PLAIN} Cloudflare WARP 管理 (测试流媒体 / 一键解锁 ChatGPT & Netflix)"
     echo -e ""
     echo -e " ${BOLD}${PURPLE}【系统优化与工具维护】${PLAIN}"
-    echo -e "   ${PURPLE}8.${PLAIN} 官方内核版本切换 (一键升级到最新正式版或指定 Tag)"
     echo -e "   ${PURPLE}10.${PLAIN} 实时查看运行日志 (Journalctl 追踪)"
     echo -e "   ${PURPLE}11.${PLAIN} 一键原版 BBR + FQ 加速 (网络拥塞控制调优)"
-    echo -e "   ${PURPLE}7.${PLAIN} 在线拉取更新部署脚本"
+    echo -e "   ${PURPLE}12.${PLAIN} 官方内核版本切换 (一键升级到最新正式版或指定 Tag)"
+    echo -e "   ${PURPLE}13.${PLAIN} 在线拉取更新部署脚本"
     echo -e "${CYAN}──────────────────────────────────────────────────────────────────────${PLAIN}"
     echo -e "   ${BOLD}0.${PLAIN} 退出管理控制台"
     echo -e "${CYAN}──────────────────────────────────────────────────────────────────────${PLAIN}"
-    echo -e " ${BOLD}${PURPLE}❤ 致敬与鸣谢: 特别感谢 ygkkk (甬哥) 与 fscarmen (F佬) 两位巨佬的开源贡献与灵感支持！${PLAIN}"
+    echo -e " ${BOLD}${PURPLE}❤ 致敬与特别鸣谢: 本脚本基于并深度修改自 ygkkk (甬哥) 与 fscarmen (F佬) 的开源脚本！${PLAIN}"
     echo -e "${CYAN}══════════════════════════════════════════════════════════════════════${PLAIN}"
 
     read -rp "请输入选项编号 [0-13]: " menu_num
     case "$menu_num" in
         1) install_singbox ;;
         2) uninstall_singbox ;;
-        3) change_configuration ;;
-        4) change_ports_and_hopping ;;
-        5) route_rules_management ;;
-        6) toggle_singbox ;;
-        7) update_script ;;
-        8) update_singbox_core ;;
-        9) show_node_info ;;
+        3) toggle_singbox ;;
+        4) change_configuration ;;
+        5) change_ports_and_hopping ;;
+        6) manage_acme ;;
+        7) show_node_info ;;
+        8) route_rules_management ;;
+        9) manage_warp ;;
         10) view_logs ;;
         11) enable_bbr ;;
-        12) manage_acme ;;
-        13) manage_warp ;;
+        12) update_singbox_core ;;
+        13) update_script ;;
         0) exit 0 ;;
         *)
             echo -e "${RED}无效输入，请输入 0-13 之间的有效数字！${PLAIN}"
@@ -1195,12 +1196,21 @@ main_menu() {
 # Entry Point
 if [[ $# -gt 0 ]]; then
     case "$1" in
-        install) install_singbox ;;
-        uninstall) uninstall_singbox ;;
-        info) show_node_info ;;
+        install | 1) install_singbox ;;
+        uninstall | 2) uninstall_singbox ;;
+        toggle | 3) toggle_singbox ;;
+        config | 4) change_configuration ;;
+        port | 5) change_ports_and_hopping ;;
+        acme | 6) manage_acme ;;
+        info | 7 | 9) show_node_info ;;
+        route | 8) route_rules_management ;;
+        warp | 9) manage_warp ;;
+        log | logs | 10) view_logs ;;
+        bbr | 11) enable_bbr ;;
+        core | 12) update_singbox_core ;;
+        update | 13) update_script ;;
         restart) systemctl restart sing-box ;;
         status) systemctl status sing-box ;;
-        bbr) enable_bbr ;;
         *) main_menu ;;
     esac
 else
