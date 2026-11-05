@@ -5,10 +5,10 @@
 # 核心技术亮点 (100% 同步 F佬 fscarmen/sing-box 最新 Naive 免域名内嵌证书方案):
 #   1. 采用 Sing-box v1.14.4 官方最新稳定版内核 (自带 libcronet.so，原生支持 Naive HTTP2/QUIC 与 AnyTLS)
 #   2. 独创双证书机制: 36500天 server.crt + 专为 Chromium 定制的 200天 cert_200.pem (带 v3 SAN: DNS:addons.mozilla.org)
-#   3. 节点链接直接内嵌 200天证书 (v2rayn://naive/... 与 naive+https://...&tls_certificate=...)，
-#      无需购买域名、无需 Argo 中转、无需往 Windows 手动导入证书，v2rayN / Karing 直接导入 100% 绿字秒通！
+#   3. 同时提供【F佬同款 Sing-box / Karing 原生 JSON 配置文件 (内嵌 200天证书数组)】与【v2rayN 内嵌证书订阅】，
+#      无需购买域名、无需 Argo 中转、无需往 Windows 手动导入证书，v2rayN / Karing 直接导入 JSON 或订阅 100% 绿字秒通！
 #   4. 默认分配 15000-59999 高位随机非标端口，纯 IPv6 (Hax) 与双栈自适应
-#   5. 标准化 HTTP/1.1 [::] 双栈订阅服务：带 Content-Length，自动按 User-Agent 适配 v2rayN / Karing / 小火箭 / Clash
+#   5. 标准化 HTTP/1.1 [::] 双栈订阅服务：带 Content-Length，自动按客户端下发 v2rayN / Karing JSON / Throne / Clash
 # 致敬与特别鸣谢: 本脚本基于并深度修改自 ygkkk (甬哥) 与 fscarmen (F佬) 的开源项目！
 # 仓库地址: https://github.com/fengjunzi0404/singbox
 # ==============================================================================
@@ -25,6 +25,7 @@ PLAIN="\033[0m"
 
 CONFIG_DIR="/etc/sing-box"
 CONFIG_FILE="${CONFIG_DIR}/config.json"
+CLIENT_JSON_FILE="${CONFIG_DIR}/singbox-client.json"
 ENV_FILE="${CONFIG_DIR}/singbox.env"
 CERT_DIR="${CONFIG_DIR}/cert"
 SUB_DIR="${CONFIG_DIR}/subscription"
@@ -189,23 +190,18 @@ generate_fscarmen_certs() {
     cn_domain=$(awk -F '.' '{if (NF>=2) print $(NF-1)"."$NF; else print $0}' <<< "$tls_sni")
 
     openssl ecparam -genkey -name prime256v1 -out "${CERT_DIR}/server.key" 2>/dev/null
-
     cat << EOF > "${CERT_DIR}/cert.conf"
 [req]
 distinguished_name = req_distinguished_name
 x509_extensions = v3_req
 prompt = no
-
 [req_distinguished_name]
 CN = ${cn_domain}
-
 [v3_req]
 subjectAltName = @alt_names
-
 [alt_names]
 DNS = ${tls_sni}
 EOF
-
     openssl req -new -x509 -days 36500 -key "${CERT_DIR}/server.key" -out "${CERT_DIR}/server.crt" -config "${CERT_DIR}/cert.conf" -extensions v3_req >/dev/null 2>&1
     openssl req -new -x509 -days 200 -key "${CERT_DIR}/server.key" -out "${CERT_DIR}/cert_200.pem" -config "${CERT_DIR}/cert.conf" -extensions v3_req >/dev/null 2>&1
     rm -f "${CERT_DIR}/cert.conf"
@@ -213,7 +209,7 @@ EOF
     chmod 600 "${CERT_DIR}/server.key"
 }
 
-# 部署标准化双栈订阅服务 (100% 同步 F佬内嵌证书编码，自动识别 v2rayN / Karing / Shadowrocket / Clash)
+# 部署标准化双栈订阅服务 (100% 同步 F佬内嵌证书编码，自动识别 v2rayN / Karing JSON / Throne / Clash)
 deploy_sub_server() {
     mkdir -p "$SUB_DIR"
     cat << 'PYEOF' > "${SUB_DIR}/server.py"
@@ -237,17 +233,14 @@ def load_env():
 
 def load_cert_formats(path):
     if not os.path.exists(path):
-        return "", "", ""
+        return "", "", [], ""
     with open(path, "r", encoding="utf-8") as f:
         lines = [line.strip() for line in f if line.strip()]
     # CERT_URL_1: 供 naive+https://...&tls_certificate= 使用 (逗号拼接，空格转 %20)
     url_1 = ",".join(lines).replace(" ", "%20")
-    # CERT_URL_2: 供 v2rayn://naive/... JSON 内嵌 Cert 字段使用 (
- 拼接)
-    url_2 = "
-".join(lines) + "
-"
-    # SHA256 指纹: 供 Shadowrocket hpkp 使用
+    # CERT_URL_2: 供 v2rayn://naive/... JSON 内嵌 Cert 字段使用 (CRLF 拼接)
+    url_2 = "\r\n".join(lines) + "\r\n"
+    # SHA256 指纹
     fp_sha256 = ""
     try:
         out = subprocess.check_output(["openssl", "x509", "-fingerprint", "-noout", "-sha256", "-in", path], text=True)
@@ -255,18 +248,173 @@ def load_cert_formats(path):
             fp_sha256 = out.strip().split("=")[-1].strip()
     except Exception:
         pass
-    return url_1, url_2, fp_sha256
+    return url_1, url_2, lines, fp_sha256
 
 def b64url_no_pad(text):
     raw = base64.b64encode(text.encode("utf-8")).decode("utf-8")
     return raw.replace("+", "-").replace("/", "_").rstrip("=")
 
+def build_singbox_client_json(env, cert_lines, cert200_lines):
+    ip = env.get("SERVER_IP", "127.0.0.1").strip()
+    domain = env.get("DOMAIN_NAME", "").strip()
+    raw_host = domain if domain else ip
+    sni = env.get("REALITY_SNI", "addons.mozilla.org").strip()
+    uuid = env.get("UUID", "").strip()
+    p_reality = int(env.get("PORT_REALITY", 27409))
+    p_hy2 = int(env.get("PORT_HY2", 56333))
+    p_tuic = int(env.get("PORT_TUIC", 49515))
+    p_naive = int(env.get("PORT_NAIVE", 33445))
+    p_anytls = int(env.get("PORT_ANYTLS", 20418))
+    naive_user = env.get("NAIVE_USER", "admin")
+    naive_pass = env.get("NAIVE_PASS", "")
+
+    tag_reality = f"Reality-{raw_host}"
+    tag_hy2 = f"Hy2-{raw_host}"
+    tag_tuic = f"TUIC5-{raw_host}"
+    tag_anytls = f"AnyTLS-{raw_host}"
+    tag_naive_h2 = f"Naive-HTTP2-{raw_host}"
+    tag_naive_quic = f"Naive-QUIC-{raw_host}"
+    node_tags = [tag_reality, tag_hy2, tag_tuic, tag_anytls, tag_naive_h2, tag_naive_quic]
+
+    proxy_outbounds = [
+        {
+            "type": "vless",
+            "tag": tag_reality,
+            "server": raw_host,
+            "server_port": p_reality,
+            "uuid": uuid,
+            "flow": "xtls-rprx-vision",
+            "tls": {
+                "enabled": True,
+                "server_name": sni,
+                "utls": {"enabled": True, "fingerprint": "chrome"},
+                "reality": {
+                    "enabled": True,
+                    "public_key": env.get("REALITY_PUB", ""),
+                    "short_id": env.get("REALITY_SHORT_ID", "")
+                }
+            }
+        },
+        {
+            "type": "hysteria2",
+            "tag": tag_hy2,
+            "server": raw_host,
+            "server_port": p_hy2,
+            "password": env.get("HY2_PWD", ""),
+            "tls": {
+                "enabled": True,
+                "server_name": sni,
+                "alpn": ["h3"],
+                "certificate": cert_lines
+            }
+        },
+        {
+            "type": "tuic",
+            "tag": tag_tuic,
+            "server": raw_host,
+            "server_port": p_tuic,
+            "uuid": uuid,
+            "password": env.get("TUIC_PWD", ""),
+            "congestion_control": "bbr",
+            "udp_relay_mode": "native",
+            "tls": {
+                "enabled": True,
+                "server_name": sni,
+                "alpn": ["h3"],
+                "certificate": cert_lines
+            }
+        },
+        {
+            "type": "anytls",
+            "tag": tag_anytls,
+            "server": raw_host,
+            "server_port": p_anytls,
+            "password": uuid,
+            "idle_session_check_interval": "30s",
+            "idle_session_timeout": "30s",
+            "min_idle_session": 5,
+            "tls": {
+                "enabled": True,
+                "server_name": sni,
+                "certificate": cert_lines,
+                "utls": {"enabled": True, "fingerprint": "chrome"}
+            }
+        },
+        {
+            "type": "naive",
+            "tag": tag_naive_h2,
+            "server": raw_host,
+            "server_port": p_naive,
+            "username": naive_user,
+            "password": naive_pass,
+            "udp_over_tcp": True,
+            "quic": False,
+            "tls": {
+                "enabled": True,
+                "server_name": sni,
+                "certificate": cert200_lines
+            }
+        },
+        {
+            "type": "naive",
+            "tag": tag_naive_quic,
+            "server": raw_host,
+            "server_port": p_naive,
+            "username": naive_user,
+            "password": naive_pass,
+            "udp_over_tcp": False,
+            "quic": True,
+            "quic_congestion_control": "bbr",
+            "tls": {
+                "enabled": True,
+                "server_name": sni,
+                "certificate": cert200_lines
+            }
+        }
+    ]
+
+    full_config = {
+        "log": {"level": "warn", "timestamp": True},
+        "inbounds": [
+            {
+                "type": "mixed",
+                "tag": "mixed-in",
+                "listen": "127.0.0.1",
+                "listen_port": 10808
+            }
+        ],
+        "outbounds": proxy_outbounds + [
+            {
+                "type": "selector",
+                "tag": "🚀 节点选择",
+                "outbounds": ["⚡ 自动选择"] + node_tags,
+                "default": "⚡ 自动选择"
+            },
+            {
+                "type": "urltest",
+                "tag": "⚡ 自动选择",
+                "outbounds": node_tags,
+                "url": "http://www.gstatic.com/generate_204",
+                "interval": "3m0s",
+                "tolerance": 50
+            },
+            {
+                "type": "direct",
+                "tag": "direct"
+            }
+        ],
+        "route": {
+            "final": "🚀 节点选择"
+        }
+    }
+    return full_config
+
 class SubHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
-    def send_payload(self, code, content_type, data_bytes):
-        self.send_response(code)
+    def send_payload(self, status_code, content_type, data_bytes):
+        self.send_response(status_code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data_bytes)))
         self.send_header("Connection", "close")
@@ -290,10 +438,8 @@ class SubHandler(http.server.BaseHTTPRequestHandler):
             qs = urllib.parse.parse_qs(parsed.query)
             token = qs.get("token", [""])[0].strip()
             expected_token = env.get("SUB_TOKEN", "").strip()
-
-            if expected_token and token != expected_token:
-                self.send_payload(403, "text/plain; charset=utf-8", b"403 Forbidden: Invalid Subscription Token
-")
+            if expected_token and token != expected_token and expected_token not in parsed.path:
+                self.send_payload(403, "text/plain; charset=utf-8", b"403 Forbidden: Invalid Subscription Token\n")
                 return
 
             ip = env.get("SERVER_IP", "127.0.0.1").strip()
@@ -304,10 +450,53 @@ class SubHandler(http.server.BaseHTTPRequestHandler):
             raw_host = domain if domain else ip
             sni_reality = env.get("REALITY_SNI", "addons.mozilla.org").strip()
 
-            cert_url_1, cert_url_2, _ = load_cert_formats(CERT_36500_PATH)
-            cert200_url_1, cert200_url_2, cert200_sha256 = load_cert_formats(CERT_200_PATH)
+            cert_url_1, cert_url_2, cert_lines, _ = load_cert_formats(CERT_36500_PATH)
+            cert200_url_1, cert200_url_2, cert200_lines, _ = load_cert_formats(CERT_200_PATH)
 
-            # 1. F佬同款 v2rayN 专属内嵌 200天证书 Naive 节点 (HTTP/2 & QUIC)
+            # 1. F佬同款 v2rayN 专属内嵌证书节点 (Hy2 / TUIC / AnyTLS / Naive HTTP2 & QUIC)
+            v2rayn_hy2_obj = {
+                "ConfigType": 7,
+                "ConfigVersion": 4,
+                "Remarks": f"Hy2-{raw_host}",
+                "Address": raw_host,
+                "Port": int(env.get("PORT_HY2", 56333)),
+                "Password": env.get("HY2_PWD", ""),
+                "StreamSecurity": "tls",
+                "AllowInsecure": "false",
+                "Sni": sni_reality,
+                "Cert": cert_url_2,
+                "ProtoExtraObj": {"UpMbps": 200, "DownMbps": 1000}
+            }
+            v2rayn_tuic_obj = {
+                "ConfigType": 8,
+                "CoreType": 24,
+                "ConfigVersion": 4,
+                "Remarks": f"TUIC5-{raw_host}",
+                "Address": raw_host,
+                "Port": int(env.get("PORT_TUIC", 49515)),
+                "Password": env.get("TUIC_PWD", ""),
+                "Username": uuid,
+                "StreamSecurity": "tls",
+                "AllowInsecure": "false",
+                "Sni": sni_reality,
+                "Alpn": "h3",
+                "Cert": cert_url_2,
+                "ProtoExtraObj": {"CongestionControl": "bbr"}
+            }
+            v2rayn_anytls_obj = {
+                "ConfigType": 11,
+                "CoreType": 24,
+                "ConfigVersion": 4,
+                "Remarks": f"AnyTLS-{raw_host}",
+                "Address": raw_host,
+                "Port": int(env.get("PORT_ANYTLS", 20418)),
+                "Password": uuid,
+                "StreamSecurity": "tls",
+                "AllowInsecure": "false",
+                "Sni": sni_reality,
+                "Fingerprint": "chrome",
+                "Cert": cert_url_2
+            }
             v2rayn_naive_h2_obj = {
                 "ConfigType": 12,
                 "CoreType": 24,
@@ -340,40 +529,32 @@ class SubHandler(http.server.BaseHTTPRequestHandler):
                     "NaiveQuic": True
                 }
             }
-            v2rayn_anytls_obj = {
-                "ConfigType": 11,
-                "CoreType": 24,
-                "ConfigVersion": 4,
-                "Remarks": f"AnyTLS-{raw_host}",
-                "Address": raw_host,
-                "Port": int(env.get("PORT_ANYTLS", 20418)),
-                "Password": uuid,
-                "StreamSecurity": "tls",
-                "AllowInsecure": "false",
-                "Sni": sni_reality,
-                "Fingerprint": "chrome",
-                "Cert": cert_url_2
-            }
 
+            vless_reality_uri = f"vless://{uuid}@{url_ip}:{env.get('PORT_REALITY', '27409')}?encryption=none&flow=xtls-rprx-vision&security=reality&sni={sni_reality}&fp=chrome&pbk={env.get('REALITY_PUB', '')}&sid={env.get('REALITY_SHORT_ID', '')}&type=tcp&headerType=none#Reality-{raw_host}"
+            v2rayn_hy2_uri = "v2rayn://hysteria2/" + b64url_no_pad(json.dumps(v2rayn_hy2_obj, separators=(",", ":")))
+            v2rayn_tuic_uri = "v2rayn://tuic/" + b64url_no_pad(json.dumps(v2rayn_tuic_obj, separators=(",", ":")))
+            v2rayn_anytls_uri = "v2rayn://anytls/" + b64url_no_pad(json.dumps(v2rayn_anytls_obj, separators=(",", ":")))
             v2rayn_naive_h2_uri = "v2rayn://naive/" + b64url_no_pad(json.dumps(v2rayn_naive_h2_obj, separators=(",", ":")))
             v2rayn_naive_quic_uri = "v2rayn://naive/" + b64url_no_pad(json.dumps(v2rayn_naive_quic_obj, separators=(",", ":")))
-            v2rayn_anytls_uri = "v2rayn://anytls/" + b64url_no_pad(json.dumps(v2rayn_anytls_obj, separators=(",", ":")))
 
-            # 2. Karing / Throne / NekoBox 标准内嵌证书 URI
-            throne_naive_h2_uri = f"naive+https://{env.get('NAIVE_USER', 'admin')}:{env.get('NAIVE_PASS', '')}@{target}:{env.get('PORT_NAIVE', '33445')}?uot=1&security=tls&sni={sni_reality}&tls_certificate={cert200_url_1}#Naive-HTTP2-{raw_host}"
-            throne_naive_quic_uri = f"naive+quic://{env.get('NAIVE_USER', 'admin')}:{env.get('NAIVE_PASS', '')}@{target}:{env.get('PORT_NAIVE', '33445')}?congestion_control=bbr&security=tls&sni={sni_reality}&tls_certificate={cert200_url_1}#Naive-QUIC-{raw_host}"
-            std_anytls_uri = f"anytls://{uuid}@{target}:{env.get('PORT_ANYTLS', '20418')}?security=tls&sni={sni_reality}&insecure=1&tls_certificate={cert_url_1}&fp=chrome#AnyTLS-{raw_host}"
-
-            base_links = [
-                f"vless://{uuid}@{url_ip}:{env.get('PORT_REALITY', '27409')}?encryption=none&flow=xtls-rprx-vision&security=reality&sni={sni_reality}&fp=chrome&pbk={env.get('REALITY_PUB', '')}&sid={env.get('REALITY_SHORT_ID', '')}&type=tcp&headerType=none#Reality-{ip}",
-                f"hysteria2://{env.get('HY2_PWD', '')}@{target}:{env.get('PORT_HY2', '56333')}/?insecure=1&sni={sni_reality}#Hy2-{raw_host}",
-                f"tuic://{uuid}:{env.get('TUIC_PWD', '')}@{target}:{env.get('PORT_TUIC', '49515')}?congestion_control=bbr&alpn=h3&sni={sni_reality}&udp_relay_mode=native&allow_insecure=1#TUIC5-{raw_host}",
+            # 2. Throne / NekoBox / Karing 标准 URI 列表 (绝不混入 v2rayn:// 私有头)
+            throne_links = [
+                vless_reality_uri,
+                f"hysteria2://{env.get('HY2_PWD', '')}@{target}:{env.get('PORT_HY2', '56333')}/?allowInsecure=false&sni={sni_reality}&security=tls&tls_certificate={cert_url_1}#Hy2-{raw_host}",
+                f"tuic://{env.get('TUIC_PWD', '')}:{uuid}@{target}:{env.get('PORT_TUIC', '49515')}?congestion_control=bbr&alpn=h3&sni={sni_reality}&udp_relay_mode=native&allow_insecure=0&security=tls&tls_certificate={cert_url_1}#TUIC5-{raw_host}",
+                f"anytls://{uuid}@{target}:{env.get('PORT_ANYTLS', '20418')}?idle_session_check_interval=30s&idle_session_timeout=30s&min_idle_session=5&insecure=0&security=tls&sni={sni_reality}&tls_certificate={cert_url_1}&fp=chrome#AnyTLS-{raw_host}",
+                f"naive+https://{env.get('NAIVE_USER', 'admin')}:{env.get('NAIVE_PASS', '')}@{target}:{env.get('PORT_NAIVE', '33445')}?uot=1&security=tls&sni={sni_reality}&tls_certificate={cert200_url_1}#Naive-HTTP2-{raw_host}",
+                f"naive+quic://{env.get('NAIVE_USER', 'admin')}:{env.get('NAIVE_PASS', '')}@{target}:{env.get('PORT_NAIVE', '33445')}?congestion_control=bbr&security=tls&sni={sni_reality}&tls_certificate={cert200_url_1}#Naive-QUIC-{raw_host}"
             ]
 
             fmt = qs.get("format", [""])[0].lower()
             ua = self.headers.get("User-Agent", "").lower()
+            path_lower = parsed.path.lower()
 
-            if fmt in ["clash", "meta", "yaml"]:
+            if fmt in ["singbox", "sing-box", "json", "karing"] or path_lower.endswith("/sing-box") or any(k in ua for k in ["karing", "sfa", "sfi", "sfm", "sing-box"]):
+                sb_json = build_singbox_client_json(env, cert_lines, cert200_lines)
+                self.send_payload(200, "application/json; charset=utf-8", json.dumps(sb_json, indent=2, ensure_ascii=False).encode("utf-8"))
+            elif fmt in ["clash", "meta", "yaml"] or path_lower.endswith("/clash") or any(k in ua for k in ["clash", "mihomo", "flclash", "verge"]):
                 yaml_content = f"""port: 7890
 socks-port: 7891
 allow-lan: true
@@ -431,18 +612,21 @@ rules:
   - MATCH,PROXY
 """
                 self.send_payload(200, "text/yaml; charset=utf-8", yaml_content.encode("utf-8"))
-            elif "v2rayn" in ua or fmt == "v2rayn":
-                v2_links = base_links + [v2rayn_naive_h2_uri, v2rayn_naive_quic_uri, v2rayn_anytls_uri]
-                self.send_payload(200, "text/plain; charset=utf-8", base64.b64encode("
-".join(v2_links).encode("utf-8")))
+            elif fmt == "throne" or path_lower.endswith("/throne") or any(k in ua for k in ["throne", "nekobox", "nekoray"]):
+                self.send_payload(200, "text/plain; charset=utf-8", base64.b64encode("\n".join(throne_links).encode("utf-8")))
             else:
-                # 通用 Base64 (兼容 Karing / Throne / NekoBox / v2rayN)
-                all_links = base_links + [throne_naive_h2_uri, throne_naive_quic_uri, std_anytls_uri, v2rayn_naive_h2_uri]
-                self.send_payload(200, "text/plain; charset=utf-8", base64.b64encode("
-".join(all_links).encode("utf-8")))
+                # 默认与 v2rayN 订阅: 100% 同步 F佬 /v2rayn 格式 (内嵌 200天 SAN 证书)
+                v2_links = [
+                    vless_reality_uri,
+                    v2rayn_hy2_uri,
+                    v2rayn_tuic_uri,
+                    v2rayn_anytls_uri,
+                    v2rayn_naive_h2_uri,
+                    v2rayn_naive_quic_uri
+                ]
+                self.send_payload(200, "text/plain; charset=utf-8", base64.b64encode("\n".join(v2_links).encode("utf-8")))
         except Exception as e:
-            err_msg = f"500 Internal Error: {str(e)}
-".encode("utf-8")
+            err_msg = f"500 Internal Error: {str(e)}\n".encode("utf-8")
             self.send_payload(500, "text/plain; charset=utf-8", err_msg)
 
 class DualStackServer(socketserver.ThreadingTCPServer):
@@ -469,7 +653,7 @@ PYEOF
 
     cat << 'EOF' > /etc/systemd/system/singbox-sub.service
 [Unit]
-Description=SingBox Suite Pro DualStack Subscription Server
+Description=Sing-box Dual-Stack Subscription Server (Fscarmen Embedded Cert Mode)
 After=network.target
 
 [Service]
@@ -484,9 +668,14 @@ EOF
     systemctl daemon-reload
     systemctl enable --now singbox-sub >/dev/null 2>&1
     systemctl restart singbox-sub >/dev/null 2>&1
+    sleep 1
+    if ! systemctl is-active --quiet singbox-sub 2>/dev/null; then
+        pkill -f "/etc/sing-box/subscription/server.py" 2>/dev/null || true
+        nohup python3 "${SUB_DIR}/server.py" >/dev/null 2>&1 &
+    fi
 }
 
-# 生成 Sing-box v1.14.4 五协议共存 config.json
+# 生成 Sing-box v1.14.4 五协议共存服务端 config.json
 # 关键: naive 入站使用 200天有效期 + v3 SAN (DNS:addons.mozilla.org) 的 cert_200.pem！
 write_singbox_config() {
     source "$ENV_FILE"
@@ -546,6 +735,9 @@ write_singbox_config() {
       "ignore_client_bandwidth": false,
       "tls": {
         "enabled": true,
+        "alpn": [
+          "h3"
+        ],
         "certificate_path": "${CERT_DIR}/server.crt",
         "key_path": "${CERT_DIR}/server.key"
       }
@@ -745,16 +937,18 @@ EOF
 
     deploy_sub_server
 
-    # 创建快捷指令 sb
-    if [[ "$0" != "$SHORTCUT_PATH" && -f "$0" ]]; then
+    # 创建快捷指令 sb (兼容 bash <(curl ...) 管道进程替换场景)
+    if [[ -f "$0" && "$0" != "$SHORTCUT_PATH" ]]; then
         cp -f "$0" "$SHORTCUT_PATH" 2>/dev/null || true
-        chmod +x "$SHORTCUT_PATH" 2>/dev/null || true
+    else
+        curl -fsSL "${REPO_RAW_URL}?t=$(date +%s)" -o "$SHORTCUT_PATH" 2>/dev/null || wget -qO "$SHORTCUT_PATH" "${REPO_RAW_URL}?t=$(date +%s)" 2>/dev/null || true
     fi
+    chmod +x "$SHORTCUT_PATH" 2>/dev/null || true
 
     show_nodes
 }
 
-# 选项 7: 刷新并打印全部五协议节点与订阅链接 (含 F佬同款内嵌证书 v2rayn://naive/ 与 naive+https://)
+# 选项 7: 刷新并打印全部五协议节点、F佬同款 Sing-box/Karing JSON 配置与在线订阅链接
 show_nodes() {
     if [[ ! -f "$ENV_FILE" ]]; then
         echo -e "${RED}[提示] 尚未安装配置 Sing-box，请先运行选项 1 进行安装！${PLAIN}"
@@ -768,11 +962,16 @@ show_nodes() {
         sed -i "s|^SERVER_IP=.*|SERVER_IP=\"$SERVER_IP\"|" "$ENV_FILE"
     fi
 
-    # 若缺失 cert_200.pem 则自动补齐
+    # 若缺失 cert_200.pem 则自动补齐并重载配置
     if [[ ! -s "${CERT_DIR}/cert_200.pem" ]]; then
         generate_fscarmen_certs "${REALITY_SNI:-addons.mozilla.org}"
-        systemctl restart sing-box singbox-sub 2>/dev/null || true
+        write_singbox_config
+        systemctl restart sing-box 2>/dev/null || true
     fi
+
+    # 确保订阅服务代码为最新并处于监听状态
+    deploy_sub_server
+    open_firewall_ports
 
     local url_ip="${SERVER_IP}"
     [[ "$SERVER_IP" == *":"* ]] && url_ip="[${SERVER_IP}]"
@@ -780,16 +979,93 @@ show_nodes() {
     local raw_host="${DOMAIN_NAME:-$SERVER_IP}"
 
     # 编码 F佬同款内嵌证书字符串
-    local CERT_URL_1 CERT_URL_2 CERT_200_URL_1 CERT_200_URL_2
+    local CERT_URL_1 CERT_URL_2 CERT_200_URL_1 CERT_200_URL_2 CERT_JSON_ARR CERT200_JSON_ARR
     CERT_URL_1=$(awk '{printf "%s,", $0}' "${CERT_DIR}/server.crt" 2>/dev/null | sed 's/ /%20/g; s/,$//')
     CERT_URL_2=$(awk '{printf "%s\\r\\n", $0}' "${CERT_DIR}/server.crt" 2>/dev/null)
     CERT_200_URL_1=$(awk '{printf "%s,", $0}' "${CERT_DIR}/cert_200.pem" 2>/dev/null | sed 's/ /%20/g; s/,$//')
     CERT_200_URL_2=$(awk '{printf "%s\\r\\n", $0}' "${CERT_DIR}/cert_200.pem" 2>/dev/null)
+    CERT_JSON_ARR=$(awk 'BEGIN{sep=""} {printf "%s\"%s\"", sep, $0; sep=","}' "${CERT_DIR}/server.crt" 2>/dev/null)
+    CERT200_JSON_ARR=$(awk 'BEGIN{sep=""} {printf "%s\"%s\"", sep, $0; sep=","}' "${CERT_DIR}/cert_200.pem" 2>/dev/null)
 
     local V2RAYN_NAIVE_H2 V2RAYN_NAIVE_QUIC V2RAYN_ANYTLS
     V2RAYN_NAIVE_H2="v2rayn://naive/$(echo -n "{\"ConfigType\":12,\"CoreType\":24,\"ConfigVersion\":4,\"Remarks\":\"Naive-HTTP2-${raw_host}\",\"Address\":\"${raw_host}\",\"Port\":${PORT_NAIVE},\"Password\":\"${NAIVE_PASS}\",\"Username\":\"${NAIVE_USER}\",\"StreamSecurity\":\"tls\",\"AllowInsecure\":\"false\",\"Sni\":\"${REALITY_SNI}\",\"Cert\":\"${CERT_200_URL_2}\"}" | base64 -w0 | tr '+/' '-_' | tr -d '=')"
     V2RAYN_NAIVE_QUIC="v2rayn://naive/$(echo -n "{\"ConfigType\":12,\"CoreType\":24,\"ConfigVersion\":4,\"Remarks\":\"Naive-QUIC-${raw_host}\",\"Address\":\"${raw_host}\",\"Port\":${PORT_NAIVE},\"Password\":\"${NAIVE_PASS}\",\"Username\":\"${NAIVE_USER}\",\"StreamSecurity\":\"tls\",\"AllowInsecure\":\"false\",\"Sni\":\"${REALITY_SNI}\",\"Cert\":\"${CERT_200_URL_2}\",\"ProtoExtraObj\":{\"CongestionControl\":\"bbr\",\"NaiveQuic\":true}}" | base64 -w0 | tr '+/' '-_' | tr -d '=')"
     V2RAYN_ANYTLS="v2rayn://anytls/$(echo -n "{\"ConfigType\":11,\"CoreType\":24,\"ConfigVersion\":4,\"Remarks\":\"AnyTLS-${raw_host}\",\"Address\":\"${raw_host}\",\"Port\":${PORT_ANYTLS},\"Password\":\"${UUID}\",\"StreamSecurity\":\"tls\",\"AllowInsecure\":\"false\",\"Sni\":\"${REALITY_SNI}\",\"Fingerprint\":\"chrome\",\"Cert\":\"${CERT_URL_2}\"}" | base64 -w0 | tr '+/' '-_' | tr -d '=')"
+
+    # 生成 F佬同款本地 Sing-box / Karing 客户端完整 JSON 配置文件 (/etc/sing-box/singbox-client.json)
+    cat << EOF > "$CLIENT_JSON_FILE"
+{
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "Reality-${raw_host}",
+      "server": "${raw_host}",
+      "server_port": ${PORT_REALITY},
+      "uuid": "${UUID}",
+      "flow": "xtls-rprx-vision",
+      "tls": {
+        "enabled": true,
+        "server_name": "${REALITY_SNI}",
+        "utls": { "enabled": true, "fingerprint": "chrome" },
+        "reality": { "enabled": true, "public_key": "${REALITY_PUB}", "short_id": "${REALITY_SHORT_ID}" }
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "Hy2-${raw_host}",
+      "server": "${raw_host}",
+      "server_port": ${PORT_HY2},
+      "password": "${HY2_PWD}",
+      "tls": { "enabled": true, "server_name": "${REALITY_SNI}", "alpn": ["h3"], "certificate": [${CERT_JSON_ARR}] }
+    },
+    {
+      "type": "tuic",
+      "tag": "TUIC5-${raw_host}",
+      "server": "${raw_host}",
+      "server_port": ${PORT_TUIC},
+      "uuid": "${UUID}",
+      "password": "${TUIC_PWD}",
+      "congestion_control": "bbr",
+      "udp_relay_mode": "native",
+      "tls": { "enabled": true, "server_name": "${REALITY_SNI}", "alpn": ["h3"], "certificate": [${CERT_JSON_ARR}] }
+    },
+    {
+      "type": "anytls",
+      "tag": "AnyTLS-${raw_host}",
+      "server": "${raw_host}",
+      "server_port": ${PORT_ANYTLS},
+      "password": "${UUID}",
+      "idle_session_check_interval": "30s",
+      "idle_session_timeout": "30s",
+      "min_idle_session": 5,
+      "tls": { "enabled": true, "server_name": "${REALITY_SNI}", "certificate": [${CERT_JSON_ARR}], "utls": { "enabled": true, "fingerprint": "chrome" } }
+    },
+    {
+      "type": "naive",
+      "tag": "Naive-HTTP2-${raw_host}",
+      "server": "${raw_host}",
+      "server_port": ${PORT_NAIVE},
+      "username": "${NAIVE_USER}",
+      "password": "${NAIVE_PASS}",
+      "udp_over_tcp": true,
+      "quic": false,
+      "tls": { "enabled": true, "server_name": "${REALITY_SNI}", "certificate": [${CERT200_JSON_ARR}] }
+    },
+    {
+      "type": "naive",
+      "tag": "Naive-QUIC-${raw_host}",
+      "server": "${raw_host}",
+      "server_port": ${PORT_NAIVE},
+      "username": "${NAIVE_USER}",
+      "password": "${NAIVE_PASS}",
+      "udp_over_tcp": false,
+      "quic": true,
+      "quic_congestion_control": "bbr",
+      "tls": { "enabled": true, "server_name": "${REALITY_SNI}", "certificate": [${CERT200_JSON_ARR}] }
+    }
+  ]
+}
+EOF
 
     echo -e "\n${GREEN}======================================================================${PLAIN}"
     echo -e "${BOLD}          Sing-Box v1.14.4 五协议节点配置与在线订阅信息 (F佬内嵌证书版)      ${PLAIN}"
@@ -809,27 +1085,34 @@ show_nodes() {
     echo -e "${BOLD}3. TUIC v5 (端口 ${PORT_TUIC} | UDP BBR 多路复用):${PLAIN}"
     echo -e "${GREEN}tuic://${UUID}:${TUIC_PWD}@${target}:${PORT_TUIC}?congestion_control=bbr&alpn=h3&sni=${REALITY_SNI}&udp_relay_mode=native&allow_insecure=1#TUIC5-${raw_host}${PLAIN}\n"
 
-    echo -e "${BOLD}4. NaiveProxy (端口 ${PORT_NAIVE} | F佬同款链接内嵌 200天证书，无 -202 报错):${PLAIN}"
-    echo -e "${YELLOW}👉 [v2rayN 专用链接 - 复制后在 v2rayN 按 Ctrl+V 导入，自动填好证书直接秒通]:${PLAIN}"
+    echo -e "${BOLD}4. NaiveProxy (端口 ${PORT_NAIVE} | F佬同款内嵌 200天证书，无 -202 报错):${PLAIN}"
+    echo -e "${YELLOW}👉 [v2rayN 专用链接 - 推荐直接通过下方订阅链接导入，避免终端换行截断]:${PLAIN}"
     echo -e "${GREEN}${V2RAYN_NAIVE_H2}${PLAIN}"
     echo -e "${GREEN}${V2RAYN_NAIVE_QUIC}${PLAIN}"
-    echo -e "${YELLOW}👉 [Karing / Throne / NekoBox 专用链接 - URL 内嵌 tls_certificate 证书]:${PLAIN}"
+    echo -e "${YELLOW}👉 [Throne / NekoBox 专用链接 - URL 内嵌 tls_certificate 证书]:${PLAIN}"
     echo -e "${GREEN}naive+https://${NAIVE_USER}:${NAIVE_PASS}@${target}:${PORT_NAIVE}?uot=1&security=tls&sni=${REALITY_SNI}&tls_certificate=${CERT_200_URL_1}#Naive-HTTP2-${raw_host}${PLAIN}\n"
 
     echo -e "${BOLD}5. AnyTLS (端口 ${PORT_ANYTLS} | Sing-box 1.14 原生 AnyTLS 协议):${PLAIN}"
-    echo -e "${YELLOW}👉 [Karing / Throne / Shadowrocket 通用链接]:${PLAIN}"
+    echo -e "${YELLOW}👉 [Throne / Shadowrocket 通用链接]:${PLAIN}"
     echo -e "${GREEN}anytls://${UUID}@${target}:${PORT_ANYTLS}?security=tls&sni=${REALITY_SNI}&insecure=1&tls_certificate=${CERT_URL_1}&fp=chrome#AnyTLS-${raw_host}${PLAIN}"
     echo -e "${YELLOW}👉 [v2rayN 专用内嵌证书链接]:${PLAIN}"
-    echo -e "${GREEN}${V2RAYN_ANYTLS}${PLAIN}"
+    echo -e "${GREEN}${V2RAYN_ANYTLS}${PLAIN}\n"
 
     echo -e "----------------------------------------------------------------------"
-    echo -e "${YELLOW}【一键在线订阅地址 (自动识别客户端 User-Agent 下发内嵌证书节点)】${PLAIN}"
-    echo -e " 通用自适应 Base64 订阅链接 (v2rayN / Karing / Shadowrocket / Throne 直接填入):"
-    echo -e " ${GREEN}http://${url_ip}:${SUB_PORT}/sub?token=${SUB_TOKEN}${PLAIN}\n"
-    echo -e " v2rayN 强制专属订阅链接 (包含内嵌证书的 v2rayn://naive 与 anytls):"
-    echo -e " ${GREEN}http://${url_ip}:${SUB_PORT}/sub?token=${SUB_TOKEN}&format=v2rayn${PLAIN}\n"
-    echo -e " Clash.Meta / Mihomo 专属 YAML 订阅链接:"
-    echo -e " ${GREEN}http://${url_ip}:${SUB_PORT}/sub?token=${SUB_TOKEN}&format=clash${PLAIN}"
+    echo -e "${YELLOW}【F佬同款 Sing-box / Karing 原生 JSON 配置 (已保存在 ${CLIENT_JSON_FILE})】${PLAIN}"
+    cat "$CLIENT_JSON_FILE"
+    echo -e "----------------------------------------------------------------------"
+    echo -e "${YELLOW}【一键在线订阅地址 (注意：每次重装端口已随机刷新为 ${SUB_PORT}，请复制最新链接到客户端)】${PLAIN}"
+    echo -e " 1. 全能自适应订阅链接 (自动识别 v2rayN / Karing / Sing-box / Clash / Throne):"
+    echo -e "    ${GREEN}http://${url_ip}:${SUB_PORT}/sub?token=${SUB_TOKEN}${PLAIN}\n"
+    echo -e " 2. Karing / Sing-box (SFI/SFA/SFM) 专属原生 JSON 订阅 (含内嵌 200天证书数组，强烈推荐 Karing 使用):"
+    echo -e "    ${GREEN}http://${url_ip}:${SUB_PORT}/sub?token=${SUB_TOKEN}&format=singbox${PLAIN}\n"
+    echo -e " 3. v2rayN 专属内嵌证书订阅 (包含 v2rayn://naive 与 anytls/hy2/tuic 全证书):"
+    echo -e "    ${GREEN}http://${url_ip}:${SUB_PORT}/sub?token=${SUB_TOKEN}&format=v2rayn${PLAIN}\n"
+    echo -e " 4. Throne / NekoBox 专属 URI 订阅:"
+    echo -e "    ${GREEN}http://${url_ip}:${SUB_PORT}/sub?token=${SUB_TOKEN}&format=throne${PLAIN}\n"
+    echo -e " 5. Clash.Meta / Mihomo 专属 YAML 订阅:"
+    echo -e "    ${GREEN}http://${url_ip}:${SUB_PORT}/sub?token=${SUB_TOKEN}&format=clash${PLAIN}"
     echo -e "${GREEN}======================================================================${PLAIN}"
 }
 
@@ -838,6 +1121,7 @@ uninstall_singbox() {
     echo -e "${YELLOW}正在停止并卸载 Sing-box 与订阅微服务...${PLAIN}"
     systemctl stop sing-box singbox-sub argo 2>/dev/null || true
     systemctl disable sing-box singbox-sub argo 2>/dev/null || true
+    pkill -f "/etc/sing-box/subscription/server.py" 2>/dev/null || true
     rm -f /etc/systemd/system/sing-box.service /etc/systemd/system/singbox-sub.service /etc/systemd/system/argo.service
     systemctl daemon-reload
     rm -rf "$CONFIG_DIR" "$BIN_PATH" /usr/local/bin/libcronet.so /usr/local/lib/libcronet.so
@@ -957,7 +1241,7 @@ enable_bbr() {
     echo -e "${GREEN}[OK] BBR + FQ 拥塞控制加速已开启！当前队列算法: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo bbr)${PLAIN}"
 }
 
-# 选项 13: 在线防缓存更新脚本
+# 选项 13: 在线防缓存更新脚本并同步修复订阅守护进程
 update_script() {
     echo -e "${BLUE}正在从 GitHub 仓库拉取最新 sb.sh 脚本 (带防缓存时间戳)...${PLAIN}"
     if curl -fsSL "${REPO_RAW_URL}?t=$(date +%s)" -o "$SHORTCUT_PATH" || wget -qO "$SHORTCUT_PATH" "${REPO_RAW_URL}?t=$(date +%s)"; then
@@ -999,7 +1283,7 @@ show_menu() {
     echo -e "   ${GREEN}6.${PLAIN} 管理 Acme.sh 域名证书 (支持自有域名 Standalone 申请)"
     echo ""
     echo -e " ${BOLD}【订阅管理与分流解锁】${PLAIN}"
-    echo -e "   ${GREEN}7.${PLAIN} 刷新查看节点配置与订阅链接 (v2rayN 内嵌证书链接 / Karing / Clash)"
+    echo -e "   ${GREEN}7.${PLAIN} 刷新查看节点配置与订阅链接 (F佬 JSON 配置 / v2rayN / Karing / Clash)"
     echo -e "   ${GREEN}8.${PLAIN} 路由分流管理 (校准 v1.14 标准路由与 DNS 策略)"
     echo -e "   ${GREEN}9.${PLAIN} 网络连通性与流媒体解锁自检 (IPv6 / NAT64 / Cloudflare 边缘检测)"
     echo ""
