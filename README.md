@@ -2,7 +2,6 @@
 
 > 🚀 支持 **VLESS-Reality-Vision**、**Hysteria 2 (hy2)**、**TUIC v5**、**AnyTLS**、**NaiveProxy** 官方版本多协议共存。
 > 💡 专为常规双栈 VPS 与 **纯 IPv6 (IPv6-Only 如 Hax) VPS** 深度优化，内置 DNS64/NAT64 自动打通与 Cloudflare WARP 双栈出站！
-> 💖 **致敬与特别鸣谢**: 本项目基于并深度修改/参考了 **[ygkkk (甬哥坎坎坷坷)](https://github.com/yonggekkk)** 与 **[fscarmen (F佬)](https://github.com/fscarmen/sing-box)** 两位前辈的优秀开源脚本与架构灵感，谨致崇高敬意！
 
 ---
 
@@ -68,6 +67,7 @@
 # 推荐：wget 方式 (适用于 Hax 等未预装 curl 的纯 IPv6 系统)
 wget -qO /usr/local/bin/sb https://raw.githubusercontent.com/fengjunzi0404/singbox/main/sb.sh && chmod +x /usr/local/bin/sb && /usr/local/bin/sb
 
+```bash
 # 或使用 curl 方式：
 curl -fsSL https://raw.githubusercontent.com/fengjunzi0404/singbox/main/sb.sh -o /usr/local/bin/sb && chmod +x /usr/local/bin/sb && /usr/local/bin/sb
 ```
@@ -88,3 +88,6 @@ sb
 | **Shadowrocket (小火箭)** | iOS / iPadOS | 全部协议 | 扫描终端二维码或剪贴板导入 |
 | **V2rayN** | Windows | VLESS-Reality, Hy2, TUIC | 批量粘贴通用链接 |
 | **NekoBox** | Android / Windows | 全部协议 | 批量链接导入 |
+
+
+> 💖 **致敬与特别鸣谢**: 本项目基于并深度修改/参考了 **[ygkkk (甬哥坎坎坷坷)](https://github.com/yonggekkk)** 与 **[fscarmen (F佬)](https://github.com/fscarmen/sing-box)** 两位前辈的优秀开源脚本与架构灵感，谨致崇高敬意！
