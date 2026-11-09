@@ -7,7 +7,7 @@
 
 1. **五协议全量共存 (All-In-One 单脚本自包含)**
    - **VLESS-Reality-Vision**：默认采用 `addons.mozilla.org` 全球双栈伪装源 + 高位随机端口，彻底绕过国内运营商对 IPv6 `443` 端口的入站阻断。
-   - **NaiveProxy + Cloudflare Argo 免费权威证书隧道 (默认自动集成)**：执行选项 `1` 安装时**默认自动拉起 Cloudflare Argo Quick Tunnel**，自动获取 `*.trycloudflare.com:443` 官方权威 CA 证书域名。**无需购买域名、无需手动复制导入 `server.crt` 证书**，Chrome 网络栈与 v2rayN 100% 信任，彻底消除 `net_error -202 (cert authority invalid)` 报错！
+   - **NaiveProxy:必须申请证书  
    - **Hysteria 2 (UDP/QUIC)**：内置自签 EC 证书与客户端 `insecure=1`，暴力抗丢包。
    - **TUIC v5 (UDP/QUIC)**：原生 BBR 拥塞控制 + ALPN `h3` 低延迟多路复用。
    - **AnyTLS (VLESS + TLS / TCP)**：稳定可靠的标准 TCP 加密传输通道。
