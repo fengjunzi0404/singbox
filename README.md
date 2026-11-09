@@ -29,10 +29,16 @@
 ```bash
 wget -qO /usr/local/bin/sb "https://raw.githubusercontent.com/fengjunzi0404/singbox/main/sb.sh?t=$(date +%s)" && chmod +x /usr/local/bin/sb && /usr/local/bin/sb
 ```
+```bash
+curl -sSL "https://raw.githubusercontent.com/fengjunzi0404/singbox/main/sb.sh?t=$(date +%s)" -o /usr/local/bin/sb && chmod +x /usr/local/bin/sb && /usr/local/bin/sb
+```
 
 ### 方式二：零交互无人值守一键部署（无需按任何回车，直接输出全部节点与订阅）
 ```bash
 wget -qO /usr/local/bin/sb "https://raw.githubusercontent.com/fengjunzi0404/singbox/main/sb.sh?t=$(date +%s)" && chmod +x /usr/local/bin/sb && /usr/local/bin/sb -y
+```
+```bash
+curl -fsSL "https://raw.githubusercontent.com/fengjunzi0404/singbox/main/sb.sh?t=$(date +%s)" -o /usr/local/bin/sb && chmod +x /usr/local/bin/sb && /usr/local/bin/sb -y
 ```
 
 > 日常管理只需在终端输入快捷指令：`sb`（或直接输入 `sb 7` 查看全部节点与订阅链接）。
